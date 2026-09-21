@@ -7,10 +7,12 @@ suitable for jq queries, schema validators, and round-trip reconstruction.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
+from pathlib import Path
 
 from dbt_plan.formatter import CheckResult, format_json
-from dbt_plan.predictor import DDLOperation, DDLPrediction, DownstreamImpact, Safety
+from dbt_plan.predictor import RISK_SAFETY, DDLOperation, DDLPrediction, DownstreamImpact, Safety
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -55,10 +57,10 @@ class TestJsonSchemaStability:
     def test_top_level_keys_always_present(self):
         """Every JSON output carries the same top-level keys, findings or not.
 
-        uncompiled_models joined the set in 0.7.0. Additive, so a consumer reading
-        the older four keys is unaffected -- but it is part of the contract now and
-        must be emitted even when empty, or a consumer cannot tell "none" from
-        "this dbt-plan is too old to know".
+        uncompiled_models joined the set in 0.7.0 and stale_sources after it. Both
+        are additive, so a consumer reading the older keys is unaffected -- but each
+        is part of the contract once shipped and must be emitted even when empty, or
+        a consumer cannot tell "none" from "this dbt-plan is too old to know".
         """
         result = CheckResult()
         data = _parse(result)
@@ -66,6 +68,7 @@ class TestJsonSchemaStability:
             "summary",
             "models",
             "parse_failures",
+            "stale_sources",
             "skipped_models",
             "uncompiled_models",
         }
@@ -186,6 +189,14 @@ class TestJsonSchemaStability:
         data = _parse(result)
         assert data["parse_failures"] == ["broken_sql"]
         assert data["skipped_models"] == ["orphan"]
+
+    def test_documented_cascade_risks_match_the_runtime_vocabulary(self):
+        docs = (Path(__file__).parents[1] / "docs" / "configuration.md").read_text(
+            encoding="utf-8"
+        )
+        section = docs.split("#### Cascade risk vocabulary", 1)[1].split("### ", 1)[0]
+        documented = set(re.findall(r"^\| `([^`]+)` \|", section, re.MULTILINE))
+        assert documented == set(RISK_SAFETY)
 
 
 # ===========================================================================
@@ -456,6 +467,7 @@ class TestJqFriendlyPatterns:
             input=json_str,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         return proc.stdout.strip()

@@ -82,11 +82,13 @@ def _setup_target(project_dir: Path, models_sql: dict[str, str], manifest: dict)
 class TestCorruptedManifest:
     """Base manifest contains invalid JSON — _do_check should not crash."""
 
-    def test_corrupted_base_manifest_falls_back_gracefully(self, tmp_path, capsys):
-        """Corrupted base manifest.json ({broken) should be silently skipped.
+    def test_corrupted_base_manifest_is_reported_not_walked_past(self, tmp_path, capsys):
+        """A base manifest that will not parse is not the revision it claims to be.
 
-        _do_check wraps base manifest loading in try/except (json.JSONDecodeError, OSError).
-        The check should still succeed using only the current manifest.
+        It must not be skipped in silence: deleted-model detection is off, so a
+        check that exits 0 would be a confident wrong answer (#155). The model
+        diffs that can still be computed are still shown -- the report just has to
+        say the baseline is unusable and refuse to exit clean.
         """
         project_dir = tmp_path / "project"
         project_dir.mkdir()
@@ -106,14 +108,14 @@ class TestCorruptedManifest:
         captured = capsys.readouterr()
         result = json.loads(captured.out)
 
-        # Should not crash — falls back to current manifest only
-        assert exit_code == 0
+        assert exit_code == 2
+        assert result["baseline_problem"] == "corrupt"
         assert result["summary"]["total"] == 1
         assert result["models"][0]["model_name"] == "dim_user"
         assert result["models"][0]["safety"] == "safe"
 
     def test_corrupted_current_manifest_returns_error(self, tmp_path, capsys):
-        """Corrupted current manifest.json should return exit code 2 with error message."""
+        """Corrupted current manifest.json should return exit code 3 with error message."""
         project_dir = tmp_path / "project"
         project_dir.mkdir()
 
@@ -135,7 +137,7 @@ class TestCorruptedManifest:
         exit_code = _do_check(_check_args(project_dir))
         captured = capsys.readouterr()
 
-        assert exit_code == 2
+        assert exit_code == 3
         assert "Could not parse manifest.json" in captured.err
 
 
@@ -147,8 +149,13 @@ class TestCorruptedManifest:
 class TestEmptyManifest:
     """Base manifest.json is an empty string — json.JSONDecodeError should be caught."""
 
-    def test_empty_base_manifest_falls_back(self, tmp_path, capsys):
-        """Empty base manifest.json should be silently skipped (json.JSONDecodeError)."""
+    def test_empty_base_manifest_is_a_corrupt_baseline(self, tmp_path, capsys):
+        """Empty base manifest.json cannot claim to describe the baseline stats.
+
+        Empty input is not JSON, so it is the corrupt case (#155), not a missing
+        one: the snapshot is not the revision it claims to be, and a check that
+        exits 0 on it would be a confident wrong answer.
+        """
         project_dir = tmp_path / "project"
         project_dir.mkdir()
 
@@ -165,12 +172,12 @@ class TestEmptyManifest:
         captured = capsys.readouterr()
         result = json.loads(captured.out)
 
-        # Should not crash
-        assert exit_code == 0
+        assert exit_code == 2
+        assert result["baseline_problem"] in ("missing", "corrupt")
         assert result["summary"]["total"] == 1
 
     def test_empty_current_manifest_returns_error(self, tmp_path, capsys):
-        """Empty current manifest.json should return exit code 2 when diffs exist."""
+        """Empty current manifest.json should return exit code 3 when diffs exist."""
         project_dir = tmp_path / "project"
         project_dir.mkdir()
 
@@ -191,7 +198,7 @@ class TestEmptyManifest:
         exit_code = _do_check(_check_args(project_dir))
         captured = capsys.readouterr()
 
-        assert exit_code == 2
+        assert exit_code == 3
         assert "Could not parse manifest.json" in captured.err
 
     def test_empty_current_manifest_is_an_error_even_with_no_diff(self, tmp_path, capsys):
@@ -222,7 +229,7 @@ class TestEmptyManifest:
         exit_code = _do_check(_check_args(project_dir))
         captured = capsys.readouterr()
 
-        assert exit_code == 2
+        assert exit_code == 3
         assert "manifest" in captured.err.lower()
 
 
@@ -268,7 +275,8 @@ class TestMissingCompiledInSnapshot:
         model_map = {m["model_name"]: m for m in result["models"]}
         assert model_map["model_a"]["safety"] == "safe"
         assert model_map["model_b"]["safety"] == "safe"
-        assert exit_code == 0
+        assert exit_code == 2
+        assert result["baseline_problem"]
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +393,8 @@ class TestPartialSnapshot:
         assert "model_b" in model_names  # added
         assert "model_c" in model_names  # added
         assert result["summary"]["total"] == 2
-        assert exit_code == 0  # added models are safe
+        assert exit_code == 2
+        assert result["baseline_problem"]  # added models are safe
 
 
 # ---------------------------------------------------------------------------
@@ -466,7 +475,8 @@ class TestSnapshotDirIsFile:
             _do_snapshot(_snapshot_args(project_dir))
             # If it succeeds, verify the snapshot was created properly
             captured = capsys.readouterr()
-            assert "Snapshot saved" in captured.out
+            assert "Snapshot saved" in captured.err
+            assert "Snapshot saved" not in captured.out
             assert (project_dir / ".dbt-plan" / "base" / "compiled").is_dir()
             snapshot_succeeded = True
         except (NotADirectoryError, OSError):
@@ -497,7 +507,7 @@ class TestSnapshotDirIsFile:
         capsys.readouterr()
 
         # Should return error exit code, not crash with unhandled exception
-        assert exit_code == 2
+        assert exit_code == 3
 
 
 # ---------------------------------------------------------------------------
@@ -618,7 +628,13 @@ class TestBaseManifestMissing:
     """Base snapshot has compiled SQL but no manifest.json at all."""
 
     def test_check_works_without_base_manifest(self, tmp_path, capsys):
-        """Check should still work using only the current manifest."""
+        """The model diff can still be read, but the check must not exit 0.
+
+        With the base manifest gone, deleted-model detection is off and the
+        baseline is not the revision it claims to be, so the report has to say so
+        and the exit code has to refuse to pass (see #155). The diff itself is
+        computed from the compiled SQL and is still reported.
+        """
         project_dir = tmp_path / "project"
         project_dir.mkdir()
 
@@ -635,7 +651,8 @@ class TestBaseManifestMissing:
         captured = capsys.readouterr()
         result = json.loads(captured.out)
 
-        assert exit_code == 0
+        assert exit_code == 2
+        assert result["baseline_problem"] == "missing"
         assert result["summary"]["total"] == 1
         assert result["models"][0]["model_name"] == "dim_user"
 
@@ -671,3 +688,26 @@ class TestBinaryFilesInSnapshot:
         assert result["summary"]["total"] == 1
         assert result["models"][0]["model_name"] == "model_a"
         assert exit_code == 0
+
+
+@pytest.mark.parametrize("missing", [["orders"], ["orders", "reader"]])
+def test_missing_baseline_sql_is_not_a_new_safe_model(tmp_path, capsys, missing):
+    from dbt_plan.cli import _do_check, _do_snapshot
+
+    manifest = _minimal_manifest({"orders": {}, "reader": {}})
+    _setup_target(
+        tmp_path,
+        {"orders": "select id, tax from raw", "reader": "select tax from orders"},
+        manifest,
+    )
+    _do_snapshot(_snapshot_args(tmp_path))
+    for name in missing:
+        next((tmp_path / ".dbt-plan/base/compiled").rglob(name + ".sql")).unlink()
+    _setup_target(
+        tmp_path, {"orders": "select id from raw", "reader": "select tax from orders"}, manifest
+    )
+    capsys.readouterr()
+    code = _do_check(_check_args(tmp_path))
+    report = json.loads(capsys.readouterr().out)
+    assert code != 0
+    assert "orders" in report["baseline_problem"]

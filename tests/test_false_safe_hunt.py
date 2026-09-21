@@ -390,19 +390,8 @@ class TestUnionAllBranchChange:
 class TestIncrementalIgnoreColumnRemoval:
     """incremental+ignore silently leaves stale columns in the physical table."""
 
-    def test_ignore_with_column_removal_is_safe(self):
-        """TRUE SAFE from DDL perspective: ignore means no DDL, no build failure.
-
-        dbt run WILL succeed. Column c remains in the physical table
-        but new rows won't populate it (NULL for new inserts).
-        This is exactly what on_schema_change=ignore means -- the user
-        has opted into this behavior.
-
-        dbt-plan correctly reports SAFE because:
-        1. No DDL will be executed
-        2. dbt run will not fail
-        3. The user explicitly chose "ignore" mode
-        """
+    def test_ignore_with_column_removal_warns(self):
+        """Ignoring schema DDL does not guarantee a successful incremental build."""
         result = predict_ddl(
             model_name="fct_orders",
             materialization="incremental",
@@ -410,10 +399,8 @@ class TestIncrementalIgnoreColumnRemoval:
             base_columns=["a", "b", "c"],
             current_columns=["a", "b"],
         )
-        # Verdict: TRUE SAFE -- ignore mode is explicit user choice.
-        # No DDL, no build failure. Stale data is expected behavior.
-        assert result.safety == Safety.SAFE
-        assert any(op.operation == "NO DDL" for op in result.operations)
+        assert result.safety == Safety.WARNING
+        assert any("BUILD FAILURE" in op.operation for op in result.operations)
 
     def test_ignore_skips_cascade_analysis(self):
         """incremental+ignore: cascade analysis is correctly skipped.
@@ -445,7 +432,7 @@ class TestIncrementalIgnoreColumnRemoval:
         assert updated[0].downstream_impacts == []
 
     def test_ignore_default_none_on_schema_change(self):
-        """on_schema_change=None defaults to 'ignore' -- ensure no surprise."""
+        """Ignoring schema DDL does not guarantee a successful incremental build."""
         result = predict_ddl(
             model_name="fct",
             materialization="incremental",
@@ -453,8 +440,7 @@ class TestIncrementalIgnoreColumnRemoval:
             base_columns=["a", "b", "c"],
             current_columns=["a"],
         )
-        # None -> ignore -> SAFE
-        assert result.safety == Safety.SAFE
+        assert result.safety == Safety.WARNING
 
 
 # ===================================================================
@@ -1174,13 +1160,13 @@ class TestSnapshotAlwaysWarning:
 # Attack Vector 19: incremental + sync_all_columns column reorder
 #
 # Same column set but different order.
-# sync_all_columns may reorder columns (drop + re-add).
+# sync_all_columns compares column names; projection order alone causes no DDL.
 # ===================================================================
 class TestSyncColumnReorder:
-    """sync_all_columns detects column reordering."""
+    """sync_all_columns ignores projection order when column names are unchanged."""
 
-    def test_reorder_detected(self):
-        """CORRECTLY CAUGHT: column reorder with sync_all_columns -> WARNING."""
+    def test_reorder_is_safe(self):
+        """Projection order alone does not change dbt's column set or emit DDL."""
         result = predict_ddl(
             model_name="m",
             materialization="incremental",
@@ -1188,8 +1174,8 @@ class TestSyncColumnReorder:
             base_columns=["a", "b", "c"],
             current_columns=["c", "b", "a"],
         )
-        assert result.safety == Safety.WARNING
-        assert any("REORDER" in op.operation for op in result.operations)
+        assert result.safety == Safety.SAFE
+        assert result.operations == []
 
     def test_no_reorder_when_same_order(self):
         """Same order -> SAFE, no reorder warning."""

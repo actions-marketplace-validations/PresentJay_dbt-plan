@@ -325,7 +325,6 @@ class TestConfigSharedAcrossProjects:
         assert config.dialect == "snowflake"
         assert config.warning_exit_code == 2
         assert config.format == "text"
-        assert config.include_packages is False
 
 
 # ===========================================================================
@@ -337,7 +336,13 @@ class TestMultipleProjectsInCompiledDir:
     """When target/compiled/ has multiple project subdirs, user gets a clear error."""
 
     def test_multiple_projects_raises_error(self, tmp_path):
-        """Multiple project dirs in target/compiled/ raises ValueError."""
+        """With no manifest to identify the root project, it still refuses.
+
+        A package that ships models is the ordinary reason for several
+        directories here, and the manifest resolves it -- see
+        tests/test_package_projects.py. Without one, guessing would be worse
+        than stopping.
+        """
         target = tmp_path / "target"
         compiled = target / "compiled"
 
@@ -352,8 +357,12 @@ class TestMultipleProjectsInCompiledDir:
         # Error message should name both projects
         assert "project_alpha" in error_msg
         assert "project_beta" in error_msg
-        # Error message should suggest --project-dir
-        assert "--project-dir" in error_msg
+        # It must NOT suggest --project-dir. That flag points at the dbt project,
+        # and these directories are inside that project's target/, so passing it
+        # produces the identical error. It should point at the manifest instead,
+        # which is what actually decides the answer.
+        assert "--project-dir" not in error_msg
+        assert "manifest.json" in error_msg
 
     def test_multiple_projects_error_includes_all_names(self, tmp_path):
         """Error message lists ALL conflicting project names."""
@@ -371,10 +380,10 @@ class TestMultipleProjectsInCompiledDir:
         assert "proj_x" in error_msg
         assert "proj_y" in error_msg
         assert "proj_z" in error_msg
-        assert "--project-dir" in error_msg
+        assert "--project-dir" not in error_msg
 
     def test_single_project_no_error(self, tmp_path):
-        """Single project in compiled/ returns the models dir without error."""
+        """Single project in compiled/ returns its root and its model dirs."""
         target = tmp_path / "target"
         compiled = target / "compiled"
 
@@ -382,7 +391,7 @@ class TestMultipleProjectsInCompiledDir:
         models_dir.mkdir(parents=True)
 
         result = _find_compiled_dir(target)
-        assert result == models_dir
+        assert result == (compiled / "my_project", ("models",))
 
     def test_flat_layout_no_error(self, tmp_path):
         """Flat layout (target/compiled/models/) works without error."""
@@ -391,7 +400,7 @@ class TestMultipleProjectsInCompiledDir:
         models_dir.mkdir(parents=True)
 
         result = _find_compiled_dir(target)
-        assert result == models_dir
+        assert result == (target / "compiled", ("models",))
 
     def test_no_compiled_dir_returns_none(self, tmp_path):
         """Missing compiled/ directory returns None."""
@@ -411,7 +420,7 @@ class TestMultipleProjectsInCompiledDir:
         (compiled / "not_a_project").mkdir(parents=True)  # no models/ inside
 
         result = _find_compiled_dir(target)
-        assert result == compiled / "real_project" / "models"
+        assert result == (compiled / "real_project", ("models",))
 
 
 # ===========================================================================

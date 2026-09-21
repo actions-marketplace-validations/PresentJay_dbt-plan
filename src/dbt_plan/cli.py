@@ -3,45 +3,329 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import sys
-from pathlib import Path
+from collections.abc import Iterable, Sequence
+from pathlib import Path, PurePosixPath
+from typing import NamedTuple
 
+from dbt_plan.config import ConfigError
 from dbt_plan.formatter import CheckResult, format_github, format_json, format_text
 
+ERROR_EXIT_CODE = 3
 
-def _find_compiled_dir(target_dir: Path) -> Path | None:
-    """Find compiled SQL models directory inside target/.
+
+class _ArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        self.exit(ERROR_EXIT_CODE, f"{self.prog}: error: {message}\n")
+
+
+def _read_diff_sql(cached: str | None, path: Path | None) -> str | None:
+    """An undecodable model is reviewable uncertainty, not a process failure."""
+    if cached is not None or path is None:
+        return cached
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _configure_output_streams() -> None:
+    """Write CLI output as UTF-8 even when Windows defaults to a legacy code page.
+
+    The GitHub formatter intentionally emits Unicode status icons and argparse's
+    help includes arrows. Leaving the streams at cp1252 makes either path crash
+    before the command can report its result.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
+class CompiledLayout(NamedTuple):
+    """Where this project's compiled SQL is, and which of it is models."""
+
+    root: Path  # target/compiled/<project>/
+    model_dirs: tuple[str, ...]  # its `model-paths`, as written on disk
+
+
+def _manifest_layout(target_dir: Path) -> tuple[str | None, tuple[str, ...]]:
+    """The project that produced this target/, and the directories its models live in.
+
+    `model-paths` is configurable in `dbt_project.yml` and is not always `models`;
+    a project that renames it used to get "No compiled SQL found", and one that
+    lists several had every model outside `models/` silently skipped. Neither needs
+    `dbt_project.yml` parsed -- every model node records where it was declared:
+
+        "original_file_path": "transformations/stg_orders.sql"
+
+    The project name is the same field `build_node_index` uses to keep package
+    models out of the index. The two sides of dbt-plan should agree on which
+    project is yours.
+    """
+    try:
+        with (target_dir / "manifest.json").open("r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None, ()
+
+    metadata = manifest.get("metadata") or {}
+    name = metadata.get("project_name")
+    project = name if isinstance(name, str) and name else None
+
+    model_dirs: dict[str, None] = {}
+    for node_id, node in (manifest.get("nodes") or {}).items():
+        if not node_id.startswith("model."):
+            continue
+        if project and node_id.split(".")[1] != project:
+            continue  # a package's models are compiled elsewhere and are not ours
+        declared = node.get("original_file_path")
+        if isinstance(declared, str) and declared:
+            model_dirs[PurePosixPath(declared).parts[0]] = None
+    return project, tuple(model_dirs)
+
+
+# Compiled-file age fallback allows for coarse filesystem timestamps. Source
+# mtimes use nanosecond ordering without a blind tolerance window; source content
+# and matching invocation evidence provide stronger checks where available.
+_STALE_TOLERANCE_SECONDS = 1.0
+
+
+def _stale_sources(
+    project_dir: Path,
+    manifest_path: Path,
+    source_dirs: Sequence[str],
+    limit: int = 5,
+    *,
+    excluded_paths: set[str] | None = None,
+) -> list[str]:
+    """Source files modified after the manifest that claims to describe them.
+
+    dbt-plan reads `target/`, and nothing in `target/` says whether it is current.
+    When `dbt compile` fails, the compiled SQL is whatever was there before, the
+    diff comes out empty, and an empty diff reads as "nothing changed" -- so a
+    dropped column can be reported as a clean run.
+
+    A source newer than the manifest is the signal that costs nothing to check.
+    It is a heuristic in one direction only: a `git checkout` moves mtimes without
+    changing content, which reports a stale target that really is stale. A file
+    deleted since the compile is not caught, because a deletion leaves no mtime.
+
+    Returns at most `limit` paths, relative to the project; naming a couple is
+    enough to point somebody at the compile.
+    """
+    try:
+        cutoff = manifest_path.stat().st_mtime_ns
+    except OSError:
+        return []
+
+    newer: list[str] = []
+    candidates = [project_dir / name for name in source_dirs]
+    candidates.append(project_dir / "dbt_project.yml")
+    for root in candidates:
+        if root.is_file():
+            paths: Iterable[Path] = [root]
+        elif root.is_dir():
+            paths = (p for p in root.rglob("*") if p.is_file() and not p.is_symlink())
+        else:
+            continue
+        for path in paths:
+            relative = path.relative_to(project_dir).as_posix()
+            if excluded_paths and relative in excluded_paths:
+                continue  # Excluded models must not consume the diagnostic limit.
+            try:
+                if path.stat().st_mtime_ns > cutoff:
+                    # Forward slashes on every platform: this is read next to the
+                    # manifest's own `original_file_path`, which is always posix.
+                    newer.append(relative)
+            except OSError:
+                continue
+            if len(newer) >= limit:
+                return sorted(newer)
+    return sorted(newer)
+
+
+def _compilation_results(manifest_path: Path, manifest: dict) -> dict | None:
+    """Execution evidence is useful only for the manifest's own invocation."""
+    # run_results and manifest must belong to the same invocation; an old file
+    # is no evidence that the current compile completed any particular model.
+    invocation = (manifest.get("metadata") or {}).get("invocation_id")
+    try:
+        report = json.loads(
+            (manifest_path.parent / "run_results.json").read_text(encoding="utf-8")
+        )
+        if invocation and (report.get("metadata") or {}).get("invocation_id") == invocation:
+            return {r.get("unique_id"): r.get("status") for r in report.get("results", [])}
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    return None
+
+
+def _compiled_input_is_current(node_id, raw, path, manifest_path, invocation, results):
+    """Validate model or test SQL before using it as evidence of safety."""
+    compiled_code = raw.get("compiled_code")
+    if raw.get("compiled") is False:
+        return False
+    try:
+        if isinstance(compiled_code, str) and compiled_code != _read_diff_sql(None, path):
+            return False  # Success cannot validate a replaced/orphaned file.
+        if results is not None:
+            if (raw.get("config") or {}).get("materialized") == "ephemeral":
+                # Ephemeral nodes never appear in execution results.
+                return bool(raw.get("compiled")) and isinstance(compiled_code, str)
+            return results.get(node_id) in ("success", "pass")
+        if isinstance(compiled_code, str):
+            return True
+        if invocation and isinstance(raw.get("raw_code"), str):
+            return False  # Modern parsed-only nodes lack compilation evidence.
+        return path.stat().st_mtime + _STALE_TOLERANCE_SECONDS >= manifest_path.stat().st_mtime
+    except OSError:
+        return False
+
+
+def _provenance_problems(
+    project_dir, manifest_path, manifest, base_manifest, node_index, compiled_paths, relevant_names
+):
+    """Refuse incomplete/currently invalid inputs using local manifest evidence."""
+    problems = []
+    root = project_dir.resolve()
+    invocation = (manifest.get("metadata") or {}).get("invocation_id")
+    results = _compilation_results(manifest_path, manifest)
+    complete_compile = results is not None and all(
+        results.get(node.node_id) in ("success", "pass")
+        for node in node_index.values()
+        if node.materialization not in ("snapshot", "ephemeral")
+    )
+    has_sources = (project_dir / "dbt_project.yml").is_file() or any(
+        (project_dir / name).is_dir() for name in manifest.get("source_dirs", ())
+    )
+    for source in (manifest, base_manifest) if has_sources else ():
+        for field in ("source_files", "source_macros", "source_snapshots"):
+            for filename, expected in source.get(field, {}).items():
+                if source is base_manifest and complete_compile:
+                    continue
+                path = project_dir / filename
+                # Only project-local source files, never package paths or escapes.
+                if not path.resolve().is_relative_to(root):
+                    continue
+                try:
+                    content = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeError):
+                    problems.append(filename)
+                    continue
+                # Old baseline content is supposed to differ. It only tells us
+                # which deleted directories must remain visible after recompile.
+                if source is base_manifest:
+                    current_known = filename in manifest.get(field, {})
+                    if not current_known and not complete_compile:
+                        problems.append(filename)
+                    continue
+                if field == "source_snapshots":
+                    digest = hashlib.sha256(content.strip().encode("utf-8")).hexdigest()
+                    matches = bool(expected) and all(value == digest for value in expected)
+                elif field == "source_files":
+                    matches = content.strip() == expected.strip()
+                else:
+                    matches = all(block in content for block in expected)
+                if not matches:
+                    problems.append(filename)
+    for name, node in node_index.items():
+        if name not in relevant_names:
+            continue
+        raw = manifest.get("nodes", {}).get(node.node_id, {})
+        if raw.get("language") == "python" or node.materialization == "snapshot":
+            continue
+        path = compiled_paths.get(name)
+        if path is None:
+            continue
+        if not _compiled_input_is_current(
+            node.node_id, raw, path, manifest_path, invocation, results
+        ):
+            problems.append(raw.get("original_file_path") or f"compiled model {name}")
+    return problems
+
+
+def _find_compiled_dir(target_dir: Path) -> CompiledLayout | None:
+    """The directory dbt compiled this project into, and its model subdirectories.
 
     Supports two dbt layouts:
-    1. target/compiled/{project_name}/models/  (standard)
-    2. target/compiled/models/  (flat, some dbt versions/configs)
+    1. target/compiled/{project_name}/  (standard)
+    2. target/compiled/            (flat, some dbt versions/configs)
 
-    If multiple project directories exist, raises ValueError.
+    Returns the project root rather than the model directory, because `model-paths`
+    can name several and can be renamed. What is under it is grouped by the path
+    each node was declared in, so the caller filters with `iter_model_sql`.
+
+    dbt compiles every installed package into its own directory here, so a project
+    depending on a package that ships models has several. The root project is
+    identified from the manifest; only a genuinely undecidable case raises.
     """
     compiled = target_dir / "compiled"
+    try:
+        raw = json.loads((target_dir / "manifest.json").read_text(encoding="utf-8"))
+        project = (raw.get("metadata") or {}).get("project_name")
+        resources = [
+            node
+            for nid, node in raw.get("nodes", {}).items()
+            if nid.startswith(("model.", "snapshot."))
+            and (not project or nid.split(".")[1] == project)
+            and (node.get("config") or {}).get("enabled", True)
+        ]
+        if resources and all(
+            node.get("resource_type") == "snapshot" or node.get("language") == "python"
+            for node in resources
+        ):
+            # These resources are compared through the manifest, not SQL.
+            return CompiledLayout(
+                compiled if compiled.is_dir() else target_dir,
+                ("__dbt_plan_manifest_only__",),
+            )
+    except (OSError, ValueError, AttributeError):
+        pass
     if not compiled.exists():
         return None
 
-    # Flat layout: target/compiled/models/ (no project subdir)
-    flat_models = compiled / "models"
-    if flat_models.is_dir():
-        return flat_models
+    root_project, model_dirs = _manifest_layout(target_dir)
+    # An unreadable manifest, or one with no models: fall back to dbt's default
+    # rather than scanning nothing.
+    model_dirs = model_dirs or ("models",)
 
-    # Standard layout: target/compiled/{project_name}/models/
+    # Flat layout: the model directories sit directly under compiled/.
+    if any((compiled / name).is_dir() for name in model_dirs):
+        return CompiledLayout(compiled, model_dirs)
+
     candidates = [
-        d / "models" for d in sorted(compiled.iterdir()) if d.is_dir() and (d / "models").exists()
+        d
+        for d in sorted(compiled.iterdir())
+        if d.is_dir() and any((d / name).is_dir() for name in model_dirs)
     ]
     if not candidates:
         return None
     if len(candidates) > 1:
-        project_names = [c.parent.name for c in candidates]
+        # A package that ships models, almost always. The manifest names the
+        # project that owns this target directory; anything else here is a
+        # dependency and is not ours to check.
+        for candidate in candidates:
+            if candidate.name == root_project:
+                return CompiledLayout(candidate, model_dirs)
+
+        project_names = [c.name for c in candidates]
+        # Deliberately does not suggest --project-dir: these directories are
+        # inside that project's target/, so passing it changes nothing.
         raise ValueError(
             f"Multiple dbt projects found in {compiled}: {project_names}. "
-            "Use --project-dir to specify which project to check."
+            f"Could not tell which is yours: {target_dir / 'manifest.json'} "
+            + (
+                f"names project '{root_project}', which is not among them."
+                if root_project
+                else "is missing or unreadable. Run 'dbt compile' to regenerate it."
+            )
         )
-    return candidates[0]
+    return CompiledLayout(candidates[0], model_dirs)
 
 
 def _do_snapshot(args: argparse.Namespace) -> None:
@@ -51,28 +335,30 @@ def _do_snapshot(args: argparse.Namespace) -> None:
     base_dir = project_dir / ".dbt-plan" / "base"
 
     try:
-        compiled_dir = _find_compiled_dir(target_dir)
+        found = _find_compiled_dir(target_dir)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
-        sys.exit(2)
+        sys.exit(ERROR_EXIT_CODE)
+    compiled_dir = found[0] if found else None
     if compiled_dir is None:
         print(
-            "Error: No compiled SQL found. "
-            "Run 'dbt compile' first to generate compiled SQL in the target/ directory.",
+            f"Error: No compiled SQL found in {target_dir}. "
+            "Run 'dbt compile' first to generate compiled SQL there.",
             file=sys.stderr,
         )
-        sys.exit(2)
+        sys.exit(ERROR_EXIT_CODE)
 
     if base_dir.exists():
         # Validate base_dir is inside project to prevent path traversal via symlinks
         resolved_base = base_dir.resolve()
         resolved_project = project_dir.resolve()
-        if not str(resolved_base).startswith(str(resolved_project) + "/"):
+        # is_relative_to includes equality; require a strict child before deleting.
+        if resolved_base == resolved_project or not resolved_base.is_relative_to(resolved_project):
             print(
                 "Error: snapshot base directory escapes project directory",
                 file=sys.stderr,
             )
-            sys.exit(2)
+            sys.exit(ERROR_EXIT_CODE)
         if base_dir.is_file():
             base_dir.unlink()
         else:
@@ -80,7 +366,10 @@ def _do_snapshot(args: argparse.Namespace) -> None:
 
     # Save compiled SQL (symlinks=True prevents following symlinks outside project)
     compiled_dest = base_dir / "compiled"
-    shutil.copytree(compiled_dir, compiled_dest, symlinks=True)
+    if found and found.model_dirs == ("__dbt_plan_manifest_only__",):
+        compiled_dest.mkdir(parents=True)
+    else:
+        shutil.copytree(compiled_dir, compiled_dest, symlinks=True)
 
     # Save manifest.json alongside compiled SQL
     manifest_src = target_dir / "manifest.json"
@@ -88,13 +377,42 @@ def _do_snapshot(args: argparse.Namespace) -> None:
         shutil.copy2(manifest_src, base_dir / "manifest.json")
     else:
         print(
-            "Warning: manifest.json not found in target/. "
+            f"Warning: manifest.json not found in {target_dir}. "
             "Run 'dbt compile' to generate it. "
             "Without it, 'dbt-plan check' will fail.",
             file=sys.stderr,
         )
 
-    print(f"Snapshot saved to {base_dir}")
+    import subprocess
+    from datetime import datetime, timezone
+
+    from dbt_plan import __version__
+
+    revision = None
+    try:
+        git = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        if git.returncode == 0:
+            revision = git.stdout.strip()
+    except OSError:
+        pass
+    (base_dir / "provenance.json").write_text(
+        json.dumps(
+            {
+                "revision": revision,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "dbt_plan_version": __version__,
+            }
+        ),
+        encoding="utf-8",
+    )
+    print(f"Snapshot saved to {base_dir}", file=sys.stderr)
 
 
 _SAMPLE_CONFIG = """\
@@ -116,7 +434,8 @@ _SAMPLE_CONFIG = """\
 # Output format: text, github, json (default: text)
 # format: text
 
-# SQL dialect for parsing (default: snowflake)
+# SQL dialect for parsing. Left unset, dbt-plan reads the adapter that produced
+# your manifest, so this is only needed to override that.
 # Supports any sqlglot dialect: snowflake, bigquery, postgres, mysql, etc.
 # dialect: snowflake
 
@@ -125,12 +444,45 @@ _SAMPLE_CONFIG = """\
 
 # Include models from dbt packages in analysis (default: false)
 # By default, only models from the root project are checked
-# include_packages: false
 
 # Command to compile dbt project (default: dbt compile)
 # Use this if you run dbt through a wrapper like uv, poetry, or a custom script
 # compile_command: uv run dbt compile
 """
+
+
+SNAPSHOT_DIR = ".dbt-plan/"
+
+
+def _gitignore_snapshots(project_dir: Path) -> None:
+    """Add the snapshot directory to `.gitignore`, for `dbt-plan init`.
+
+    Deliberately not called from `snapshot`. `dbt-plan run` snapshots with the
+    user's tree stashed, so writing to `.gitignore` there makes `.gitignore` the
+    file the pop cannot restore -- the same failure one level along. `run` keeps
+    the snapshot out of the stash instead; see `_STASH_PATHSPEC`.
+    """
+    gitignore = project_dir / ".gitignore"
+    banner = "# dbt-plan snapshots (ephemeral, do not commit)"
+    try:
+        if gitignore.exists():
+            content = gitignore.read_text(encoding="utf-8")
+            if SNAPSHOT_DIR in content:
+                return
+            with gitignore.open("a", encoding="utf-8") as f:
+                if content and not content.endswith("\n"):
+                    f.write("\n")
+                f.write(f"\n{banner}\n{SNAPSHOT_DIR}\n")
+            print(f"Added {SNAPSHOT_DIR} to .gitignore")
+        else:
+            gitignore.write_text(f"{banner}\n{SNAPSHOT_DIR}\n", encoding="utf-8")
+            print(f"Created .gitignore with {SNAPSHOT_DIR}")
+    except OSError as e:
+        print(
+            f"Warning: could not add {SNAPSHOT_DIR} to .gitignore ({e}).\n"
+            "  Add it by hand -- otherwise git sees the snapshot as your change.",
+            file=sys.stderr,
+        )
 
 
 def _do_init(args: argparse.Namespace) -> None:
@@ -144,25 +496,12 @@ def _do_init(args: argparse.Namespace) -> None:
             "Edit it directly, or delete it and re-run 'dbt-plan init'.",
             file=sys.stderr,
         )
-        sys.exit(2)
+        sys.exit(ERROR_EXIT_CODE)
 
-    config_path.write_text(_SAMPLE_CONFIG)
+    config_path.write_text(_SAMPLE_CONFIG, encoding="utf-8")
     print(f"Created {config_path}")
 
-    # Add .dbt-plan/ to .gitignore if not already there
-    gitignore = project_dir / ".gitignore"
-    entry = ".dbt-plan/"
-    if gitignore.exists():
-        content = gitignore.read_text()
-        if entry not in content:
-            with gitignore.open("a") as f:
-                if not content.endswith("\n"):
-                    f.write("\n")
-                f.write(f"\n# dbt-plan snapshots (ephemeral, do not commit)\n{entry}\n")
-            print(f"Added {entry} to .gitignore")
-    else:
-        gitignore.write_text(f"# dbt-plan snapshots (ephemeral, do not commit)\n{entry}\n")
-        print(f"Created .gitignore with {entry}")
+    _gitignore_snapshots(project_dir)
 
 
 def _do_stats(args: argparse.Namespace) -> None:
@@ -170,7 +509,10 @@ def _do_stats(args: argparse.Namespace) -> None:
     from collections import Counter
 
     from dbt_plan.columns import extract_columns
-    from dbt_plan.manifest import load_manifest
+    from dbt_plan.config import Config
+    from dbt_plan.diff import iter_model_sql
+    from dbt_plan.manifest import build_node_index, load_manifest
+    from dbt_plan.predictor import has_ddl_rule
 
     project_dir = Path(args.project_dir)
     target_dir = project_dir / args.target_dir
@@ -182,46 +524,109 @@ def _do_stats(args: argparse.Namespace) -> None:
             "Run 'dbt compile' to generate it, or use --manifest to specify a custom path.",
             file=sys.stderr,
         )
-        sys.exit(2)
+        sys.exit(ERROR_EXIT_CODE)
 
     try:
         manifest = load_manifest(manifest_path)
     except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
         print(f"Error: Could not parse manifest.json: {e}", file=sys.stderr)
-        sys.exit(2)
+        sys.exit(ERROR_EXIT_CODE)
 
-    # Count materializations and on_schema_change
+    # Count over the same index `check` builds, so package models and disabled
+    # ones are out of both. Counting models check never looks at is half of what
+    # made the two commands disagree.
+    node_index = build_node_index(manifest)
     mat_counts: Counter[str] = Counter()
-    osc_counts: Counter[str] = Counter()
     incremental_osc: Counter[str] = Counter()
-    total = 0
+    no_rule: Counter[str] = Counter()
 
-    for nid, node in (manifest.get("nodes") or {}).items():
-        if not nid.startswith("model."):
-            continue
-        total += 1
-        config = node.get("config") or {}
-        mat = config.get("materialized") or "table"
-        osc = config.get("on_schema_change") or "ignore"
-        mat_counts[mat] += 1
-        osc_counts[osc] += 1
-        if mat == "incremental":
-            incremental_osc[osc] += 1
+    for node in node_index.values():
+        mat_counts[node.materialization] += 1
+        if node.materialization == "incremental":
+            incremental_osc[node.on_schema_change or "ignore"] += 1
+        if not has_ddl_rule(node.materialization, node.on_schema_change):
+            label = node.materialization
+            if node.on_schema_change:
+                label += f" + {node.on_schema_change}"
+            elif node.materialization != "snapshot":
+                label += " (no on_schema_change)"
+            no_rule[label] += 1
+    total = len(node_index)
 
-    # Count SELECT * in compiled SQL
+    # Read every model's columns the way `check` does, resolver included. Without
+    # it, a `select * from {{ ref(x) }}` that check expands through the DAG was
+    # counted here as unanalysable, and the advice printed underneath -- "add
+    # column docs to resolve" -- was wrong for exactly those models.
     try:
-        compiled_dir = _find_compiled_dir(target_dir)
+        found = _find_compiled_dir(target_dir)
     except ValueError:
-        compiled_dir = None
-    star_count = 0
+        found = None
+    compiled_dir, model_dirs = found if found else (None, ())
+
+    star_written = 0  # the SQL asks for `*`
+    unreadable = 0  # and dbt-plan still cannot say which columns that is
+    unreadable_with_docs = 0
     sql_count = 0
     if compiled_dir:
-        dialect = getattr(args, "dialect", "snowflake") or "snowflake"
-        for sql_file in compiled_dir.rglob("*.sql"):
+        dialect = getattr(args, "dialect", None) or Config.load(project_dir).resolve_dialect(
+            (manifest.get("metadata") or {}).get("adapter_type")
+        )
+        resolver = _make_table_resolver(
+            compiled_dir, _build_relation_index(manifest, node_index), dialect, model_dirs
+        )
+        for sql_file in iter_model_sql(compiled_dir, model_dirs):
             sql_count += 1
-            cols = extract_columns(sql_file.read_text(), dialect=dialect)
-            if cols == ["*"]:
-                star_count += 1
+            sql = sql_file.read_text(encoding="utf-8")
+            if extract_columns(sql, dialect=dialect) == ["*"]:
+                star_written += 1
+            cols = extract_columns(sql, dialect=dialect, table_columns=resolver)
+            if (
+                cols is None
+                or cols == ["*"]
+                or (len(cols) == 1 and cols[0].startswith("* except("))
+            ):
+                unreadable += 1
+                node = node_index.get(sql_file.stem)
+                if node is not None and node.columns:
+                    unreadable_with_docs += 1
+
+    # Cascade risk: reuse already-computed counter instead of re-scanning manifest
+    fail_chains = incremental_osc.get("fail", 0)
+
+    compiled_stats = None
+    if sql_count:
+        compiled_stats = {
+            "select_star": {
+                "used": star_written,
+                "compiled": sql_count,
+                "percentage": star_written * 100 // sql_count,
+                "resolved_through_ref_or_cte": star_written - min(star_written, unreadable),
+            },
+            "columns_readable": {
+                "readable": sql_count - unreadable,
+                "compiled": sql_count,
+                "unreadable": unreadable,
+            },
+        }
+
+    with_rule = total - sum(no_rule.values())
+    if getattr(args, "format", None) == "json":
+        details = {
+            "unreadable_with_docs": unreadable_with_docs if sql_count else None,
+            "unreadable_without_docs": (unreadable - unreadable_with_docs if sql_count else None),
+            "no_rule": dict(sorted(no_rule.items())),
+        }
+        summary = {
+            "total": total,
+            "materializations": dict(sorted(mat_counts.items())),
+            "on_schema_change": dict(sorted(incremental_osc.items())),
+            "select_star": compiled_stats["select_star"] if compiled_stats else None,
+            "columns_readable": (compiled_stats["columns_readable"] if compiled_stats else None),
+            "cascade_risk": fail_chains,
+            "ddl_rules": {"matched": with_rule, "total": total},
+        }
+        print(json.dumps({"summary": summary, "details": details}, indent=2))
+        return
 
     # Output
     print(f"dbt-plan stats -- {total} model(s) in manifest\n")
@@ -234,31 +639,33 @@ def _do_stats(args: argparse.Namespace) -> None:
         risk = "  ← dbt-plan monitors this" if osc in ("sync_all_columns", "fail") else ""
         print(f"  {osc:20s} {count:>4}{risk}")
 
-    # Count manifest column fallback availability
-    manifest_fallback = 0
     if sql_count:
-        for nid, node in (manifest.get("nodes") or {}).items():
-            if nid.startswith("model.") and node.get("columns"):
-                manifest_fallback += 1
-
-        pct = star_count * 100 // sql_count
-        print(f"\nSELECT * usage: {star_count}/{sql_count} models ({pct}%)")
-        if star_count > 0:
-            print(f"  Manifest column fallback available: {manifest_fallback}/{total} models")
-            remaining = star_count - min(star_count, manifest_fallback)
+        # Two lines, because they are two questions. One "Coverage" answering
+        # neither is how this output used to print `SELECT * usage: 1/5` and
+        # `Coverage: 5/5 fully analyzed` one after the other.
+        pct = star_written * 100 // sql_count
+        print(f"\nSELECT * usage: {star_written}/{sql_count} models ({pct}%)")
+        print(f"Columns readable: {sql_count - unreadable}/{sql_count} compiled model(s)")
+        resolved_stars = star_written - min(star_written, unreadable)
+        if resolved_stars:
+            print(f"  SELECT * resolved through ref() or a CTE: {resolved_stars}")
+        if unreadable:
+            print(f"  unresolved: {unreadable} -- these report review required")
+            if unreadable_with_docs:
+                print(f"    manifest columns documented for {unreadable_with_docs} of them")
+            remaining = unreadable - unreadable_with_docs
             if remaining:
-                print(f"  Remaining without fallback: {remaining} (add column docs to resolve)")
+                print(f"    no fallback for {remaining} (add column docs to resolve)")
 
-    # Cascade risk: reuse already-computed counter instead of re-scanning manifest
-    fail_chains = incremental_osc.get("fail", 0)
     if fail_chains:
         print(f"\nCascade risk: {fail_chains} incremental model(s) with on_schema_change=fail")
         print("  These will break if upstream schema changes")
 
-    # Readiness score
-    monitorable = incremental_osc.get("sync_all_columns", 0) + incremental_osc.get("fail", 0)
-    safe = mat_counts.get("table", 0) + mat_counts.get("view", 0) + mat_counts.get("ephemeral", 0)
-    print(f"\nCoverage: {safe + monitorable}/{total} models fully analyzed by dbt-plan")
+    print(f"\nDDL rules: {with_rule}/{total} model(s)")
+    if no_rule:
+        print("  no rule, always review required:")
+        for label, count in no_rule.most_common():
+            print(f"    {label:38s} {count:>4}")
 
 
 def _exit_code_for(result: CheckResult, warning_exit_code: int) -> int:
@@ -287,7 +694,12 @@ def _exit_code_for(result: CheckResult, warning_exit_code: int) -> int:
     # the diff but absent from the manifest, and a model in the manifest that
     # the compile never produced. Either way the tool did not look, so it must
     # not answer "safe". Ranked below destructive so a real finding still exits 1.
-    if result.skipped_models or result.uncompiled_models:
+    if (
+        result.skipped_models
+        or result.uncompiled_models
+        or result.stale_sources
+        or result.baseline_problem
+    ):
         return warning_exit_code
     return 0
 
@@ -305,28 +717,122 @@ def _star_macro_degraded(sql: str) -> bool:
 
 
 def _build_relation_index(manifest: dict, node_index: dict) -> dict[str, str]:
-    """Map the relation a model writes -> the model's name.
+    """Map the relation a model writes -> the key its compiled SQL is indexed under.
 
     `select * from {{ ref(x) }}` compiles to the physical relation, not the model
     name, so matching needs the manifest's `relation_name`. The bare name is
     registered too: dbt model names are unique across a project, so it is an
-    unambiguous fallback when a manifest predates `relation_name`.
+    unambiguous fallback when a manifest predates `relation_name`. For a versioned
+    model both spellings point at the same file -- `fct_orders` is the name two
+    versions share, `fct_orders_v2` is the one that was written.
     """
+    from dbt_plan.manifest import model_key
+
     index: dict[str, str] = {}
     for node_id, node in (manifest.get("nodes") or {}).items():
         if not node_id.startswith("model."):
             continue
         name = node.get("name")
-        if not name or name not in node_index:
+        path = node.get("path")
+        key = Path(path).stem if path else model_key(node_id)
+        if not name or key not in node_index:
             continue
         relation = node.get("relation_name")
         if relation:
-            index[relation.replace('"', "").replace("`", "").lower()] = name
-        index.setdefault(name.lower(), name)
+            index[relation.replace('"', "").replace("`", "").lower()] = key
+        index.setdefault(key.lower(), key)
+        index.setdefault(name.lower(), key)
     return index
 
 
-def _make_table_resolver(compiled_dir, relation_index: dict[str, str], dialect: str):
+def _make_reference_reader(
+    compiled_sql_index: dict[str, Path],
+    node_index: dict,
+    table_columns,
+    dialect: str,
+    relation_index: dict[str, str] | None = None,
+):
+    """(downstream model, changed model) → the columns the first reads from the second.
+
+    None when that cannot be resolved, which is the caller's signal to fall back to
+    searching the text. The schema is every model whose columns dbt-plan can already
+    work out, keyed by bare name -- sqlglot matches that against the fully qualified
+    relation compiled dbt SQL actually contains.
+
+    Built from the *base* columns on purpose. The question is whether the downstream
+    SQL reads a column that is going away, and that column exists only on the base
+    side; against the current schema the reference is already unresolvable, which
+    would refuse and hand the true finding back to the text search.
+
+    A model with an `alias:` config writes to a relation that is not its name, and
+    compiled SQL contains only the relation. So every name a model is known by --
+    from the relation index, which already maps relations to model keys -- goes into
+    the schema and into the question. Matching on the model name alone answered
+    "does not read it" for a model that read nothing else.
+
+    Both the schema and each answer are built once and cached, because a change
+    touching many models asks about the same downstream SQL repeatedly.
+    """
+    from dbt_plan.columns import columns_read_by_relation
+
+    schema: dict[str, dict[str, str]] = {}
+    # One parse per downstream model, cached, answering for every relation it names.
+    parsed: dict[str, dict[str, list[str]] | None] = {}
+
+    names_for: dict[str, set[str]] = {name: {name.lower()} for name in node_index}
+    for relation, key in (relation_index or {}).items():
+        if key in names_for:
+            names_for[key].add(relation.rsplit(".", 1)[-1].lower())
+
+    def build_schema() -> dict[str, dict[str, str]]:
+        if schema:
+            return schema
+        for name in node_index:
+            columns = table_columns(name.lower())
+            if columns:
+                # sqlglot only needs the names; the types are never compared here.
+                for known_as in names_for.get(name, {name}):
+                    schema[known_as] = dict.fromkeys(columns, "UNKNOWN")
+        return schema
+
+    def reads_of(downstream: str) -> dict[str, list[str]] | None:
+        if downstream in parsed:
+            return parsed[downstream]
+        path = compiled_sql_index.get(downstream)
+        answer = None
+        if path is not None:
+            try:
+                answer = columns_read_by_relation(
+                    path.read_text(encoding="utf-8"), build_schema(), dialect=dialect
+                )
+            except (OSError, UnicodeDecodeError):
+                answer = None
+        parsed[downstream] = answer
+        return answer
+
+    def read(downstream: str, changed: str) -> list[str] | None:
+        # Only answer when the changed model's columns are in the schema: without
+        # them a bare column could be attributed elsewhere, and `[]` would read as
+        # "does not use it" -- a false all-clear rather than a false warning.
+        if changed.lower() not in build_schema():
+            return None
+        by_relation = reads_of(downstream)
+        if by_relation is None:
+            return None
+        return sorted(
+            {
+                col
+                for name in names_for.get(changed, {changed})
+                for col in by_relation.get(name, [])
+            }
+        )
+
+    return read
+
+
+def _make_table_resolver(
+    compiled_dir, relation_index: dict[str, str], dialect: str, model_dirs=None
+):
     """Resolve a relation to the columns of the model that produces it.
 
     dbt-plan already holds every model's compiled SQL and a manifest naming the
@@ -339,11 +845,10 @@ def _make_table_resolver(compiled_dir, relation_index: dict[str, str], dialect: 
     propagates instead of turning into a shorter, wrong column list.
     """
     from dbt_plan.columns import extract_columns
+    from dbt_plan.diff import iter_model_sql
 
     sql_by_model = (
-        {f.stem: f for f in compiled_dir.rglob("*.sql") if not f.is_symlink()}
-        if compiled_dir
-        else {}
+        {f.stem: f for f in iter_model_sql(compiled_dir, model_dirs)} if compiled_dir else {}
     )
     cache: dict[str, list[str] | None] = {}
     in_progress: set[str] = set()
@@ -360,7 +865,9 @@ def _make_table_resolver(compiled_dir, relation_index: dict[str, str], dialect: 
 
         in_progress.add(model)
         try:
-            columns = extract_columns(path.read_text(), dialect=dialect, table_columns=resolve)
+            columns = extract_columns(
+                path.read_text(encoding="utf-8"), dialect=dialect, table_columns=resolve
+            )
         except OSError:
             columns = None
         finally:
@@ -373,27 +880,98 @@ def _make_table_resolver(compiled_dir, relation_index: dict[str, str], dialect: 
     return resolve
 
 
+def _expand_selection(
+    select_models: str, child_map: dict[str, list[str]], node_index: dict
+) -> tuple[set[str], list[str]]:
+    """Expand `--select` terms into the set of model names to check.
+
+    Supports the three graph operators dbt-plan already holds the graph for:
+
+        fct_orders     that model
+        fct_orders+    it and everything downstream
+        +fct_orders    it and everything upstream
+        +fct_orders+   both
+
+    `fct_orders+` is the one that earns its keep locally: "this model and what it
+    breaks" is the question the report answers anyway.
+
+    Commas union terms. Depth limits, @, selector methods, globs and empty
+    terms are unsupported; the caller rejects the entire selection. Unknown
+    names are retained so the caller can distinguish them from known unchanged
+    models. Version aliases and graph node IDs resolve to actual compiled names;
+    an unversioned family name does not implicitly select all its versions.
+    """
+    import re
+
+    from dbt_plan.manifest import find_downstream
+
+    names_by_id = {node.node_id: node.name for node in node_index.values()}
+    selected: set[str] = set()
+    unsupported: list[str] = []
+    parent_map: dict[str, list[str]] | None = None
+
+    for raw in (term.strip() for term in select_models.split(",")):
+        if not re.fullmatch(r"\+?[\w-]+\+?", raw):
+            unsupported.append(raw or "<empty>")
+            continue
+        want_upstream = raw.startswith("+")
+        want_downstream = raw.endswith("+")
+        name = raw.strip("+")
+        node = node_index.get(name)
+        selected.add(node.name if node is not None else name)
+        if node is None or not (want_upstream or want_downstream):
+            continue
+        if want_downstream:
+            selected.update(
+                names_by_id[nid]
+                for nid in find_downstream(node.node_id, child_map)
+                if nid in names_by_id
+            )
+        if want_upstream:
+            if parent_map is None:
+                parent_map = {}
+                for parent, children in child_map.items():
+                    for child in children:
+                        parent_map.setdefault(child, []).append(parent)
+            selected.update(
+                names_by_id[nid]
+                for nid in find_downstream(node.node_id, parent_map)
+                if nid in names_by_id
+            )
+    return selected, unsupported
+
+
 def _do_check(args: argparse.Namespace) -> int:
     """Analyze compiled SQL changes and warn about DDL risks.
 
     Returns:
-        Exit code: 0=safe, 1=destructive, 2=warning/error.
+        Exit code: 0=safe, 1=destructive, 2=warning, 3=execution error.
     """
     # Lazy imports: sqlglot and heavy modules only loaded when actually needed
     from dataclasses import replace as _replace
 
-    from dbt_plan.columns import extract_cast_types, extract_columns
-    from dbt_plan.config import Config
-    from dbt_plan.diff import diff_compiled_dirs
+    from dbt_plan.columns import extract_cast_types, extract_column_details, extract_columns
+    from dbt_plan.config import Config, sqlglot_dialect_for_adapter
+    from dbt_plan.diff import ModelDiff, diff_compiled_dirs, iter_model_sql, iter_non_model_sql
     from dbt_plan.manifest import (
+        ModelNode,
+        build_data_test_index,
+        build_exposure_index,
         build_node_index,
+        build_unit_test_index,
+        find_downstream,
         find_downstream_batch,
         load_manifest,
+        model_key,
     )
     from dbt_plan.predictor import (
         DDLOperation,
+        DDLPrediction,
+        DownstreamImpact,
         Safety,
         analyze_cascade_impacts,
+        apply_contract,
+        attach_downstream_exposures,
         predict_ddl,
     )
 
@@ -407,7 +985,7 @@ def _do_check(args: argparse.Namespace) -> int:
         fmt = config.format
     no_color = getattr(args, "no_color", False) or config.no_color
     verbose = getattr(args, "verbose", False) or config.verbose
-    dialect = getattr(args, "dialect", None) or config.dialect
+    cli_dialect = getattr(args, "dialect", None)
     if ack_flag := getattr(args, "acknowledge", None):
         config.acknowledge_models = [m.strip() for m in ack_flag.split(",") if m.strip()]
 
@@ -415,7 +993,7 @@ def _do_check(args: argparse.Namespace) -> int:
         if verbose:
             print(f"  [verbose] {msg}", file=sys.stderr)
 
-    _log(f"Config: dialect={dialect}, ignore={config.ignore_models}")
+    _log(f"Config: ignore={config.ignore_models}")
 
     target_dir = project_dir / args.target_dir
     base_dir = project_dir / Path(args.base_dir)
@@ -427,7 +1005,7 @@ def _do_check(args: argparse.Namespace) -> int:
             f"Error: Base directory not found: {base_dir}. Run 'dbt-plan snapshot' first.",
             file=sys.stderr,
         )
-        return 2
+        return ERROR_EXIT_CODE
 
     # Resolve compiled SQL directories
     base_compiled = base_dir / "compiled"
@@ -437,19 +1015,26 @@ def _do_check(args: argparse.Namespace) -> int:
         _log(f"Using legacy snapshot format: {base_dir}")
 
     try:
-        current_compiled = _find_compiled_dir(target_dir)
+        found = _find_compiled_dir(target_dir)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
-        return 2
-    _log(f"Base compiled: {base_compiled}")
-    _log(f"Current compiled: {current_compiled}")
+        return ERROR_EXIT_CODE
+    current_compiled, model_dirs = found if found else (None, ())
+    # A snapshot taken before 0.14 was copied from inside the model directory, so
+    # the prefix is already gone and filtering by it would find nothing at all --
+    # which would report every model as added rather than saying the base is old.
+    base_model_dirs = (
+        model_dirs if any((base_compiled / name).is_dir() for name in model_dirs) else None
+    )
+    _log(f"Base compiled: {base_compiled} (model dirs: {base_model_dirs or 'legacy layout'})")
+    _log(f"Current compiled: {current_compiled} (model dirs: {', '.join(model_dirs)})")
     if current_compiled is None:
         print(
-            "Error: No compiled SQL found. "
-            "Run 'dbt compile' first to generate compiled SQL in the target/ directory.",
+            f"Error: No compiled SQL found in {target_dir}. "
+            "Run 'dbt compile' first to generate compiled SQL there.",
             file=sys.stderr,
         )
-        return 2
+        return ERROR_EXIT_CODE
 
     if not manifest_path.exists():
         print(
@@ -457,31 +1042,18 @@ def _do_check(args: argparse.Namespace) -> int:
             "Run 'dbt compile' to generate it, or use --manifest to specify a custom path.",
             file=sys.stderr,
         )
-        return 2
+        return ERROR_EXIT_CODE
 
     # 1. Diff compiled dirs
     _log(f"Manifest: {manifest_path}")
     try:
-        model_diffs = diff_compiled_dirs(base_compiled, current_compiled)
+        model_diffs = diff_compiled_dirs(
+            base_compiled, current_compiled, base_model_dirs, model_dirs
+        )
     except (ValueError, FileNotFoundError) as e:
         print(f"Error: {e}", file=sys.stderr)
-        return 2
+        return ERROR_EXIT_CODE
     _log(f"Found {len(model_diffs)} changed model(s)")
-    # Filter: --select (positive filter, like dbt --select)
-    select_models = getattr(args, "select", None)
-    if select_models:
-        select_set = {s.strip() for s in select_models.split(",") if s.strip()}
-        before_select = len(model_diffs)
-        model_diffs = [d for d in model_diffs if d.model_name in select_set]
-        _log(f"Selected {len(model_diffs)} model(s) matching: {select_set}")
-        if before_select > 0 and not model_diffs:
-            unmatched = select_set - {d.model_name for d in model_diffs}
-            print(
-                f"Warning: --select matched no changed models. "
-                f"Filter: {', '.join(sorted(unmatched))}",
-                file=sys.stderr,
-            )
-
     # Filter ignored models from config
     if config.ignore_models:
         before = len(model_diffs)
@@ -497,15 +1069,37 @@ def _do_check(args: argparse.Namespace) -> int:
         # JSONDecodeError: invalid JSON; OSError: file I/O error;
         # UnicodeDecodeError: non-UTF-8 file (not a subclass of OSError)
         print(f"Error: Could not parse manifest.json: {e}", file=sys.stderr)
-        return 2
+        return ERROR_EXIT_CODE
 
     base_manifest_path = base_dir / "manifest.json"
+    baseline_problem: str | None = None
     base_manifest = None
     if base_manifest_path.exists():
         try:
             base_manifest = load_manifest(base_manifest_path)
         except (json.JSONDecodeError, OSError, UnicodeDecodeError):
-            pass  # base manifest is best-effort
+            # A manifest that exists and will not parse is a corrupted snapshot:
+            # it is not the revision it claims to be, and walking past it in
+            # silence produces a confident wrong answer (see #155).
+            baseline_problem = "corrupt"
+            _log(
+                "Base manifest exists but will not parse; deleted-model detection is off. "
+                "Re-run 'dbt-plan snapshot'."
+            )
+    elif base_dir.exists():
+        # No base manifest: an older snapshot (taken before the manifest was
+        # copied) or an interrupted one. Recoverable, but deletions cannot be
+        # seen, so it is not a reason to answer safe either.
+        baseline_problem = "missing"
+        _log("Base manifest missing; deleted-model detection is off. Re-run 'dbt-plan snapshot'.")
+
+    # The manifest names the adapter that produced the project, so it decides the
+    # dialect when nobody else did -- a BigQuery project used to be parsed as
+    # Snowflake with no flags passed.
+    dialect = cli_dialect or config.resolve_dialect(
+        (manifest.get("metadata") or {}).get("adapter_type")
+    )
+    _log(f"Dialect: {dialect}")
 
     child_map = manifest.get("child_map") or {}
     if base_manifest:
@@ -515,21 +1109,138 @@ def _do_check(args: argparse.Namespace) -> int:
                 child_map[k] = v
 
     # Build O(1) lookup indexes instead of O(N) scan per model
-    node_index = build_node_index(manifest, include_packages=config.include_packages)
-    base_node_index = (
-        build_node_index(base_manifest, include_packages=config.include_packages)
-        if base_manifest
-        else {}
+    node_index = build_node_index(manifest)
+    base_node_index = build_node_index(base_manifest) if base_manifest else {}
+    # Index keys include version aliases; only node.name identifies a compiled file.
+    model_names = {node.name for node in node_index.values()}
+    base_model_names = {node.name for node in base_node_index.values()}
+
+    # Manifest-only resources and configuration can change without changing SQL.
+    non_sql_names: set[str] = set()
+    for source, index in ((manifest, node_index), (base_manifest or {}, base_node_index)):
+        project_name = (source.get("metadata") or {}).get("project_name")
+        for nid, raw in source.get("nodes", {}).items():
+            if project_name and nid.split(".")[1] != project_name:
+                continue
+            if not (raw.get("config") or {}).get("enabled", True):
+                continue
+            if nid.startswith("snapshot."):
+                name = model_key(nid)
+                index[name] = ModelNode(nid, name, "snapshot", None)
+                non_sql_names.add(name)
+            elif nid.startswith("model.") and raw.get("language") == "python":
+                non_sql_names.add(model_key(nid))
+    model_names = {node.name for node in node_index.values()}
+    base_model_names = {node.name for node in base_node_index.values()}
+    current_paths = {f.stem: f for f in iter_model_sql(current_compiled, model_dirs)}
+    base_paths = {f.stem: f for f in iter_model_sql(base_compiled, base_model_dirs)}
+    already_changed = {d.model_name for d in model_diffs}
+    metadata_fields = (
+        "config",
+        "unrendered_config",
+        "database",
+        "schema",
+        "alias",
+        "columns",
+        "language",
     )
+    for name, node in node_index.items():
+        if name in already_changed or name in config.ignore_models:
+            continue
+        raw = manifest.get("nodes", {}).get(node.node_id, {})
+        old_node = base_node_index.get(name)
+        old = (base_manifest or {}).get("nodes", {}).get(old_node.node_id, {}) if old_node else {}
+        fields = (*metadata_fields, "raw_code") if name in non_sql_names else metadata_fields
+        if old_node and all(raw.get(k) == old.get(k) for k in fields):
+            continue
+        # Ordinary new SQL models already have a file diff; missing SQL is a refusal.
+        if name not in non_sql_names and name not in current_paths:
+            continue
+        model_diffs.append(
+            ModelDiff(
+                name,
+                "modified" if old_node else "added",
+                base_paths.get(name),
+                current_paths.get(name),
+            )
+        )
+
+    # A deleted model is not in the diff. `dbt compile` never removes what it wrote
+    # before, so the orphaned compiled file is on both sides with identical bytes,
+    # and the MODEL REMOVED rule that exists for exactly this case could never fire
+    # in the normal flow. The manifest is the authority: a model the base manifest
+    # had and the current one does not is gone, whatever target/ still contains.
+    already = {d.model_name for d in model_diffs}
+    deleted = sorted(
+        name
+        for name in base_model_names
+        if name not in model_names and name not in already and name not in config.ignore_models
+    )
+    if deleted:
+        base_sql_by_stem = {f.stem: f for f in iter_model_sql(base_compiled, base_model_dirs)}
+        for name in deleted:
+            model_diffs.append(ModelDiff(name, "removed", base_sql_by_stem.get(name), None))
+        _log(f"Deleted from the manifest, still compiled: {', '.join(deleted)}")
+
+    # Filter: --select. After the manifest, because `fct_orders+` needs the graph.
+    select_models = getattr(args, "select", None)
+    relevant_names = model_names | base_model_names
+    if select_models is not None:
+        select_set, unsupported = _expand_selection(
+            select_models, child_map, {**base_node_index, **node_index}
+        )
+        if not select_set and not unsupported:
+            unsupported = [select_models]
+        if unsupported:
+            print(
+                f"Error: --select does not support {', '.join(unsupported)}. "
+                "Use comma-separated model names with one optional '+' at either end.",
+                file=sys.stderr,
+            )
+            return ERROR_EXIT_CODE
+        unknown = sorted(select_set - (model_names | base_model_names))
+        if unknown:
+            print(
+                f"Error: --select contains unknown model(s): {', '.join(unknown)}. "
+                "Use a compiled file stem; for versioned models specify the version "
+                "(for example fct_orders_v2) or its defined_in file name.",
+                file=sys.stderr,
+            )
+            return ERROR_EXIT_CODE
+        relevant_names = set(select_set)
+        parent_map: dict[str, list[str]] = {}
+        for parent, children in child_map.items():
+            for child in children:
+                parent_map.setdefault(child, []).append(parent)
+        for name in select_set:
+            selected_node = node_index.get(name) or base_node_index.get(name)
+            if selected_node:
+                for graph in (child_map, parent_map):
+                    relevant_names.update(
+                        (
+                            node_index.get(model_key(nid)) or base_node_index.get(model_key(nid))
+                        ).name
+                        for nid in find_downstream(selected_node.node_id, graph)
+                        if node_index.get(model_key(nid)) or base_node_index.get(model_key(nid))
+                    )
+        before_select = len(model_diffs)
+        model_diffs = [d for d in model_diffs if d.model_name in select_set]
+        _log(f"Selected {len(model_diffs)} of {before_select} changed model(s)")
+        if before_select > 0 and not model_diffs:
+            print(
+                f"Warning: --select matched no changed models. Filter: {select_models}",
+                file=sys.stderr,
+            )
     # `select * from {{ ref(x) }}` names a relation, not a model. These let the
     # column resolver follow that reference into the other model's compiled SQL.
     current_table_columns = _make_table_resolver(
-        current_compiled, _build_relation_index(manifest, node_index), dialect
+        current_compiled, _build_relation_index(manifest, node_index), dialect, model_dirs
     )
     base_table_columns = _make_table_resolver(
         base_compiled,
         _build_relation_index(base_manifest or manifest, base_node_index or node_index),
         dialect,
+        base_model_dirs,
     )
 
     _log(f"Manifest: {len(node_index)} model(s) indexed")
@@ -542,17 +1253,114 @@ def _do_check(args: argparse.Namespace) -> int:
     # makes it ordinary. It matters because a model missing from *both* compiled
     # directories yields no diff entry, so it is never examined -- and with
     # nothing else changed that used to print "no model changes" and exit 0.
-    compiled_stems = {f.stem for f in current_compiled.rglob("*.sql") if not f.is_symlink()}
+    compiled_stems = {f.stem for f in iter_model_sql(current_compiled, model_dirs)}
     uncompiled_models = sorted(
         name
-        for name in node_index
-        if name not in compiled_stems and name not in config.ignore_models
+        for name in model_names
+        if name not in compiled_stems
+        and name not in config.ignore_models
+        and name not in non_sql_names
+        and name in relevant_names
     )
     if uncompiled_models:
         _log(f"Uncompiled: {len(uncompiled_models)} manifest model(s) have no compiled SQL")
 
+    # The base manifest distinguishes a genuinely new model from missing input.
+    # A partial snapshot cannot establish safety, even when the diff says added.
+    base_stems = {f.stem for f in iter_model_sql(base_compiled, base_model_dirs)}
+    missing_base = sorted(
+        name
+        for name in base_model_names
+        if name not in base_stems
+        and name not in config.ignore_models
+        and name not in non_sql_names
+        and name in relevant_names
+    )
+    if missing_base:
+        baseline_problem = "Baseline compiled SQL is missing for: " + ", ".join(missing_base)
+
+    # Nothing in target/ says whether it is current. A source newer than the
+    # manifest means it may not be, and every verdict below rests on it.
+    source_dirs = sorted(
+        set(manifest.get("source_dirs") or ())
+        | set((base_manifest or {}).get("source_dirs") or ())
+    )
+    unrelated_paths: set[str] = set()
+    if select_models:
+        # Model files outside the selection's dependency/consumer graph do not
+        # invalidate it. Macro/project/schema files remain shared dependencies.
+        unrelated_paths = {
+            raw.get("original_file_path")
+            for nid, raw in manifest.get("nodes", {}).items()
+            if nid.startswith("model.")
+            and (
+                node_index.get(model_key(nid)) is None
+                or node_index[model_key(nid)].name not in relevant_names
+            )
+        }
+        related_paths = {
+            raw.get("original_file_path")
+            for nid, raw in manifest.get("nodes", {}).items()
+            if nid.startswith("model.")
+            and node_index.get(model_key(nid)) is not None
+            and node_index[model_key(nid)].name in relevant_names
+        }
+        unrelated_paths -= related_paths
+    stale_sources = _stale_sources(
+        project_dir, manifest_path, source_dirs, excluded_paths=unrelated_paths
+    )
+    stale_sources += [
+        path
+        for path in _provenance_problems(
+            project_dir,
+            manifest_path,
+            manifest,
+            base_manifest or {},
+            node_index,
+            current_paths,
+            relevant_names,
+        )
+        if path not in unrelated_paths
+    ]
+    stale_sources = sorted(set(stale_sources))
+    provenance = {"revision": None, "created_at": None}
+    try:
+        stored = json.loads((base_dir / "provenance.json").read_text(encoding="utf-8"))
+        if isinstance(stored, dict):
+            provenance.update(stored)
+    except (OSError, ValueError):
+        pass
+    adapter = (manifest.get("metadata") or {}).get("adapter_type")
+    analysis = {
+        "dialect": dialect,
+        "adapter_type": adapter,
+        "dialect_source": "cli"
+        if cli_dialect
+        else "config"
+        if config.dialect_explicit
+        else "manifest"
+        if sqlglot_dialect_for_adapter(adapter)
+        else "fallback (unmapped adapter)"
+        if adapter
+        else "default",
+        "baseline": provenance,
+        "selection": select_models,
+        "unsupported_languages": sorted(
+            name
+            for name in non_sql_names
+            if (node_index.get(name) and node_index[name].materialization != "snapshot")
+        ),
+    }
+    if stale_sources:
+        _log(f"Stale: {', '.join(stale_sources)} newer than {manifest_path.name}")
+
     if not model_diffs:
-        empty = CheckResult(uncompiled_models=uncompiled_models)
+        empty = CheckResult(
+            uncompiled_models=uncompiled_models,
+            stale_sources=stale_sources,
+            baseline_problem=baseline_problem,
+            analysis=analysis,
+        )
         if fmt == "json":
             print(format_json(empty))
         elif fmt == "github":
@@ -582,26 +1390,48 @@ def _do_check(args: argparse.Namespace) -> int:
             f"{diff.status.upper()} {diff.model_name}: "
             f"{node.materialization}, on_schema_change={node.on_schema_change}"
         )
-        base_cols = None
-        current_cols = None
-        if diff.base_sql is not None:
-            base_cols = extract_columns(
-                diff.base_sql, dialect=dialect, table_columns=base_table_columns
+        base_sql = _read_diff_sql(diff.base_sql, diff.base_path)
+        current_sql = _read_diff_sql(diff.current_sql, diff.current_path)
+        base_cols = (
+            extract_columns(base_sql, dialect=dialect, table_columns=base_table_columns)
+            if base_sql is not None
+            else None
+        )
+        current_cols = (
+            extract_columns(current_sql, dialect=dialect, table_columns=current_table_columns)
+            if current_sql is not None
+            else None
+        )
+
+        raw_node = manifest.get("nodes", {}).get(node.node_id, {})
+        is_python = raw_node.get("language") == "python"
+        non_sql = is_python or node.materialization == "snapshot"
+        # Preserve known names for cascade even when another projection is opaque.
+        base_detail = (
+            extract_column_details(base_sql, dialect=dialect, table_columns=base_table_columns)
+            if base_sql
+            else None
+        )
+        current_detail = (
+            extract_column_details(
+                current_sql, dialect=dialect, table_columns=current_table_columns
             )
-        elif diff.base_path:
-            base_cols = extract_columns(
-                diff.base_path.read_text(), dialect=dialect, table_columns=base_table_columns
-            )
-        if diff.current_sql is not None:
-            current_cols = extract_columns(
-                diff.current_sql, dialect=dialect, table_columns=current_table_columns
-            )
-        elif diff.current_path:
-            current_cols = extract_columns(
-                diff.current_path.read_text(),
-                dialect=dialect,
-                table_columns=current_table_columns,
-            )
+            if current_sql
+            else None
+        )
+        partial_unknown = any(
+            d is not None and d.has_unknown for d in (base_detail, current_detail)
+        )
+        if base_detail and base_detail.columns and base_detail.has_unknown:
+            base_cols = base_detail.columns
+        if current_detail and current_detail.columns and current_detail.has_unknown:
+            current_cols = current_detail.columns
+        sql_current_cols = None if partial_unknown else current_cols
+        if dialect not in ("duckdb", "bigquery", "sqlite", "tsql", "mysql") and any(
+            isinstance(col, dict) and col.get("quote")
+            for col in (raw_node.get("columns") or {}).values()
+        ):
+            sql_current_cols = None
 
         # Fallback: use manifest columns when SELECT * detected
         base_node = base_node_index.get(diff.model_name)
@@ -618,13 +1448,16 @@ def _do_check(args: argparse.Namespace) -> int:
         _log(f"  base_cols={base_cols}")
         _log(f"  current_cols={current_cols}")
 
-        # Track parse failures only for models where it matters
-        # (table/view are always safe via CREATE OR REPLACE, so parse failure is irrelevant)
-        if (
-            diff.status == "modified"
-            and node.materialization not in ("table", "view")
-            and (base_cols is None or current_cols is None)
-        ):
+        # A parse failure is recorded for every materialization. It used to be
+        # skipped for table and view, on the reasoning that CREATE OR REPLACE is
+        # safe whatever the columns are -- true of the model itself, and false of
+        # everything reading it. Unknown columns mean cascade cannot see a dropped
+        # one, so the run must not exit 0 while the report says SAFE. See #131.
+        parse_failed = (
+            diff.status == "modified" and (base_cols is None or current_cols is None)
+        ) or (diff.status == "added" and current_cols is None)
+        parse_failed = (parse_failed or partial_unknown) and not non_sql
+        if parse_failed:
             parse_failures.append(diff.model_name)
             if base_cols == ["*"] or current_cols == ["*"]:
                 _log(
@@ -641,10 +1474,56 @@ def _do_check(args: argparse.Namespace) -> int:
             status=diff.status,
         )
 
+        if non_sql and diff.status != "removed":
+            prediction = _replace(
+                prediction,
+                safety=Safety.WARNING,
+                operations=[
+                    DDLOperation(
+                        "REVIEW REQUIRED (Python model is not SQL-analyzable)"
+                        if is_python
+                        else "REVIEW REQUIRED (snapshot changed)"
+                    )
+                ],
+            )
+
+        if diff.status == "added" and parse_failed and prediction.safety == Safety.SAFE:
+            prediction = _replace(
+                prediction,
+                safety=Safety.WARNING,
+                operations=[DDLOperation("REVIEW REQUIRED (could not extract columns)")],
+            )
+
+        # An enforced contract is checked against the SQL, not against the base
+        # revision, so a removed model has nothing left to check.
+        if diff.status != "removed":
+            # Casts are read only under a contract: everywhere else the declared
+            # type is documentation, and this is the one place dbt enforces it.
+            contract_casts = None
+            if node.contract_enforced and node.column_types:
+                contract_casts = (
+                    extract_cast_types(current_sql, dialect=dialect) if current_sql else None
+                )
+            prediction = apply_contract(
+                prediction, node, sql_current_cols, contract_casts, dialect
+            )
+
         # Detect materialization or on_schema_change config changes
         if base_node and diff.status == "modified":
             extra_ops: list[DDLOperation] = []
             config_safety = prediction.safety
+
+            base_raw = (base_manifest or {}).get("nodes", {}).get(base_node.node_id, {})
+            for field in ("database", "schema", "alias"):
+                before = base_raw.get(field, (base_raw.get("config") or {}).get(field))
+                after = raw_node.get(field, (raw_node.get("config") or {}).get(field))
+                if before != after:
+                    extra_ops.append(
+                        DDLOperation(
+                            f"RELATION CHANGED ({field}): {before} -> {after}; existing incremental history is not moved"
+                        )
+                    )
+                    config_safety = Safety.WARNING
 
             if base_node.materialization != node.materialization:
                 extra_ops.append(
@@ -689,11 +1568,7 @@ def _do_check(args: argparse.Namespace) -> int:
         # difference between "fix your compile target" and "this tool is noisy,
         # add it to ignore_models".
         if prediction.safety == Safety.WARNING and any(
-            _star_macro_degraded(text)
-            for text in (
-                diff.current_sql or (diff.current_path.read_text() if diff.current_path else ""),
-                diff.base_sql or (diff.base_path.read_text() if diff.base_path else ""),
-            )
+            _star_macro_degraded(text) for text in (current_sql or "", base_sql or "")
         ):
             prediction = _replace(
                 prediction,
@@ -720,24 +1595,20 @@ def _do_check(args: argparse.Namespace) -> int:
             "view",
             "ephemeral",
         ):
-            base_sql_text = diff.base_sql
-            if base_sql_text is None and diff.base_path:
-                base_sql_text = diff.base_path.read_text()
-            current_sql_text = diff.current_sql
-            if current_sql_text is None and diff.current_path:
-                current_sql_text = diff.current_path.read_text()
-
-            base_casts = (
-                extract_cast_types(base_sql_text, dialect=dialect) if base_sql_text else None
-            )
+            base_casts = extract_cast_types(base_sql, dialect=dialect) if base_sql else None
             current_casts = (
-                extract_cast_types(current_sql_text, dialect=dialect) if current_sql_text else None
+                extract_cast_types(current_sql, dialect=dialect) if current_sql else None
             )
-            if base_casts and current_casts:
+            if base_casts is not None and current_casts is not None:
                 type_ops = [
-                    DDLOperation(f"TYPE CHANGED: {before} -> {current_casts[col]}", col)
-                    for col, before in sorted(base_casts.items())
-                    if col in current_casts and current_casts[col] != before
+                    DDLOperation(
+                        f"TYPE CHANGED: {base_casts.get(col, 'unknown')} -> {current_casts.get(col, 'unknown')}",
+                        col,
+                    )
+                    for col in sorted(set(base_casts) | set(current_casts))
+                    if col in (base_cols or [])
+                    and col in (current_cols or [])
+                    and base_casts.get(col) != current_casts.get(col)
                 ]
                 if type_ops:
                     prediction = _replace(
@@ -758,8 +1629,14 @@ def _do_check(args: argparse.Namespace) -> int:
         # Only SAFE is escalated; a real finding still stands on its own. table
         # and view are rebuilt by CREATE OR REPLACE whatever the columns are, so
         # escalating those would be noise with nothing behind it.
+        #
+        # An enforced contract is the exception, and the reason is the same one
+        # read the other way: dbt requires every column to be declared and fails
+        # the build otherwise, so the list is not a partial stand-in for the SQL,
+        # it is the shape dbt itself checks the SQL against.
         if (
             used_manifest_columns
+            and not node.contract_enforced
             and prediction.safety == Safety.SAFE
             and node.materialization not in ("table", "view", "ephemeral")
         ):
@@ -782,9 +1659,27 @@ def _do_check(args: argparse.Namespace) -> int:
 
     # 3c. Build compiled SQL index once (O(1) lookup instead of rglob per downstream)
     compiled_sql_index: dict[str, Path] = {}
+    test_sql_index: dict[str, Path] = {}
     if current_compiled:
-        for sql_file in current_compiled.rglob("*.sql"):
+        for sql_file in iter_model_sql(current_compiled, model_dirs):
             compiled_sql_index[sql_file.stem] = sql_file
+        for sql_file in iter_non_model_sql(current_compiled, model_dirs):
+            test_sql_index[sql_file.stem] = sql_file
+
+    # A partial compile can leave older test files beside current model SQL.
+    # Omit unverified files: cascade then reports data_test_unreadable only when
+    # that test's SQL is needed, without blocking unrelated selected models.
+    invocation = (manifest.get("metadata") or {}).get("invocation_id")
+    results = _compilation_results(manifest_path, manifest)
+    for nid, raw in manifest.get("nodes", {}).items():
+        if not nid.startswith("test."):
+            continue
+        name = raw.get("name") or nid.split(".")[-1]
+        path = test_sql_index.get(name)
+        if path is not None and not _compiled_input_is_current(
+            nid, raw, path, manifest_path, invocation, results
+        ):
+            del test_sql_index[name]
 
     # 3d. Cascade impact analysis (extracted to predictor module)
     predictions, downstream_map = analyze_cascade_impacts(
@@ -795,10 +1690,79 @@ def _do_check(args: argparse.Namespace) -> int:
         node_index=node_index,
         base_node_index=base_node_index,
         compiled_sql_index=compiled_sql_index,
+        child_map=child_map,
+        unit_test_index=build_unit_test_index(manifest),
+        data_test_index=build_data_test_index(manifest),
+        test_sql_index=test_sql_index,
+        base_columns_of=base_table_columns,
+        current_columns_of=current_table_columns,
+        columns_read_of=_make_reference_reader(
+            compiled_sql_index,
+            node_index,
+            base_table_columns,
+            dialect,
+            _build_relation_index(base_manifest or manifest, base_node_index or node_index),
+        ),
+    )
+    # A contract on an unchanged downstream SELECT * can break when upstream
+    # columns change. Resolve its SQL independently of its declared contract.
+    for pos, prediction in enumerate(predictions):
+        impacts = list(prediction.downstream_impacts)
+        for nid in all_downstream.get(model_node_ids.get(prediction.model_name), []):
+            dependent = node_index.get(model_key(nid))
+            if dependent is None or not dependent.contract_enforced:
+                continue
+            path = compiled_sql_index.get(dependent.name)
+            sql = _read_diff_sql(None, path)
+            columns = (
+                extract_columns(sql, dialect=dialect, table_columns=current_table_columns)
+                if sql
+                else None
+            )
+            contract = apply_contract(
+                DDLPrediction(
+                    dependent.name,
+                    dependent.materialization,
+                    dependent.on_schema_change,
+                    Safety.SAFE,
+                ),
+                dependent,
+                columns,
+                extract_cast_types(sql, dialect=dialect) if sql else None,
+                dialect,
+            )
+            if contract.safety != Safety.SAFE:
+                impacts.append(
+                    DownstreamImpact(
+                        dependent.name,
+                        dependent.materialization,
+                        dependent.on_schema_change,
+                        risk="contract_violation",
+                        reason="; ".join(op.operation for op in contract.operations),
+                    )
+                )
+        if len(impacts) != len(prediction.downstream_impacts):
+            predictions[pos] = _replace(
+                prediction,
+                downstream_impacts=impacts,
+                safety=prediction.safety
+                if prediction.safety == Safety.DESTRUCTIVE
+                else Safety.WARNING,
+            )
+
+    predictions = attach_downstream_exposures(
+        predictions=predictions,
+        model_node_ids=model_node_ids,
+        all_downstream=all_downstream,
+        child_map=child_map,
+        exposure_index=build_exposure_index(manifest),
+        model_cols=model_cols,
     )
     for pred in predictions:
         if pred.downstream_impacts:
             _log(f"  Cascade impacts for {pred.model_name}: {len(pred.downstream_impacts)}")
+        if pred.downstream_exposures:
+            _log(f"  Downstream exposures for {pred.model_name}: {len(pred.downstream_exposures)}")
 
     # 4. Format output
     check_result = CheckResult(
@@ -807,7 +1771,10 @@ def _do_check(args: argparse.Namespace) -> int:
         parse_failures,
         skipped_models,
         uncompiled_models,
+        stale_sources,
         acknowledge_models=config.acknowledge_models,
+        baseline_problem=baseline_problem,
+        analysis=analysis,
     )
     if fmt == "json":
         print(format_json(check_result))
@@ -834,8 +1801,8 @@ name: dbt-plan
 #   * Fork PRs receive no secrets by design; the Preflight step says so plainly
 #     instead of failing later with a confusing driver error.
 on:
-  pull_request:
-    paths: ['models/**', 'macros/**', 'dbt_project.yml']
+  # Every PR: custom paths, packages and YAML/Jinja settings can change compiled SQL.
+  pull_request: {}
 
 concurrency:
   group: dbt-plan-${{ github.event.pull_request.number }}
@@ -845,6 +1812,9 @@ jobs:
   plan:
     name: DDL Impact Check
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
     # Results go to the step summary, which needs no token scope.
     permissions:
       contents: read
@@ -873,6 +1843,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
           # dbt compile runs PR-authored code -- leave no git token on disk.
           persist-credentials: false
 
@@ -893,22 +1864,99 @@ jobs:
 
       - name: Install
         run: |
-          pip install uv && uv sync
-          pip install dbt-plan
+          python -m pip install uv
+          # Outside the checkout: switching revisions cannot replace this environment.
+          export UV_PROJECT_ENVIRONMENT="$RUNNER_TEMP/dbt-plan-venv"
+          if [ -f pyproject.toml ]; then
+            if [ -f uv.lock ]; then
+              uv sync --locked
+            else
+              uv sync
+              # uv created this untracked lock. Do not let it obstruct checkout
+              # of a baseline that does track uv.lock; no existing lock is removed.
+              rm -f uv.lock
+            fi
+          elif [ -f requirements.txt ]; then
+            uv venv "$UV_PROJECT_ENVIRONMENT"
+            uv pip install --python "$UV_PROJECT_ENVIRONMENT/bin/python" -r requirements.txt
+          else
+            echo "::error::Add pyproject.toml or requirements.txt with your dbt adapter dependencies."
+            exit 3
+          fi
+          uv pip install --python "$UV_PROJECT_ENVIRONMENT/bin/python" dbt-plan
+          if [ ! -x "$UV_PROJECT_ENVIRONMENT/bin/dbt" ]; then
+            echo "::error::Project dependencies must install dbt and its adapter. Adjust the Install step for optional dependency groups."
+            exit 3
+          fi
+          # All later steps use these installed commands, without uv run re-syncing.
+          echo "$UV_PROJECT_ENVIRONMENT/bin" >> "$GITHUB_PATH"
 
       - name: Snapshot base
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha }}
         run: |
-          git checkout ${{ github.event.pull_request.base.sha }}
-          dbt compile && dbt-plan snapshot
+          git checkout --detach "$BASE_REF"
+          dbt compile
+          dbt-plan snapshot
 
       - name: Check current
+        id: check
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.sha }}
         run: |
-          git checkout ${{ github.event.pull_request.head.sha }}
+          git checkout --detach "$HEAD_REF"
           dbt compile
-          dbt-plan check --format github >> $GITHUB_STEP_SUMMARY
+          code=0
+          report="$RUNNER_TEMP/dbt-plan-report.json"
+          dbt-plan check --format json > "$report" || code=$?
+          # Older releases also used codes 1/2 for execution failures. No report
+          # means no verdict, regardless of a user-selected warning policy.
+          if ! python -c 'import json, sys; data = json.load(open(sys.argv[1], encoding="utf-8")); sys.exit(not (isinstance(data, dict) and isinstance(data.get("summary"), dict) and isinstance(data.get("models"), list)))' "$report" 2>/dev/null; then
+            echo "::error::dbt-plan did not produce a completed JSON report (exit $code)"
+            code=3
+          fi
+          echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+
+      - name: Report
+        continue-on-error: true
+        env:
+          CODE: ${{ steps.check.outputs.exit-code }}
+        run: |
+          case "$CODE" in
+            0|1|2) ;;
+            *) echo "dbt-plan could not complete (exit $CODE). See the Check current logs." >> "$GITHUB_STEP_SUMMARY"; exit 0 ;;
+          esac
+          rendered=0
+          markdown="$RUNNER_TEMP/dbt-plan-report.md"
+          dbt-plan check --format github > "$markdown" || rendered=$?
+          case "$rendered" in
+            0|1|2)
+              if [ -s "$markdown" ]; then
+                cat "$markdown" >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi ;;
+          esac
+          # Keep the validated report visible if Markdown rendering fails.
+          echo 'Markdown unavailable; original JSON report:' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/dbt-plan-report.json" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Gate
-        run: dbt-plan check
+        if: ${{ !cancelled() && steps.check.outcome == 'success' }}
+        env:
+          CODE: ${{ steps.check.outputs.exit-code }}
+          # warning: block warnings too; never: allow findings, but not execution errors.
+          FAIL_ON: destructive
+        run: |
+          case "$CODE" in
+            0|1|2) ;;
+            *) echo "::error::dbt-plan execution failed (exit $CODE). Fix the error and rerun."; exit 3 ;;
+          esac
+          case "$FAIL_ON" in
+            never) exit 0 ;;
+            destructive) [ "$CODE" != "1" ] || exit 1 ;;
+            warning) [ "$CODE" = "0" ] || exit 1 ;;
+            *) echo "::error::FAIL_ON must be destructive, warning, or never"; exit 3 ;;
+          esac
 """
 
 
@@ -924,10 +1972,10 @@ def _do_ci_setup(args: argparse.Namespace) -> None:
             "Edit it directly, or delete it and re-run 'dbt-plan ci-setup'.",
             file=sys.stderr,
         )
-        sys.exit(2)
+        sys.exit(ERROR_EXIT_CODE)
 
     workflows_dir.mkdir(parents=True, exist_ok=True)
-    workflow_path.write_text(_CI_WORKFLOW)
+    workflow_path.write_text(_CI_WORKFLOW, encoding="utf-8")
     print(f"Created {workflow_path}")
     print("Push this file to enable dbt-plan on every PR.")
 
@@ -947,8 +1995,13 @@ After changing any model SQL, materialization, or `on_schema_change` setting, an
 opening or approving a pull request:
 
 ```bash
-dbt-plan run
+dbt-plan run --against main
 ```
+
+`--against main` compares with where this branch left `main`. Without it the baseline is
+your last commit, so anything you have already committed -- which, by the time you are
+opening a pull request, is most of it -- is not compared at all. Replace `main` with
+whatever this repository's default branch is called.
 
 That compiles the baseline and the current state, then compares them. It shells out to
 `dbt compile`, so it needs the same warehouse credentials `dbt compile` normally needs.
@@ -956,20 +2009,41 @@ dbt-plan itself never connects to the warehouse and never runs SQL.
 
 ### Reading the result
 
-- `0` — every change is safe.
-- `1` — destructive: a column is being dropped, or a model removed.
-- `2` — dbt-plan could not answer. Either it could not read a model, or it never saw one.
-  A human has to look.
+- `0` — no blocking findings under the configured policy.
+- `1` — destructive: a column is being dropped, a model removed, or a downstream
+  reference broken.
+- `2` — review needed: dbt-plan found a possible build/test failure or could not fully
+  assess the change. A human has to look.
+- `3` — execution failed: invalid input, a compile/recovery failure, or an internal
+  error prevented completion. Fix the error and rerun; there is no completed verdict.
 
 A warning is not automatically a blocker; it means "explain this before merging."
 
-`2` covers several situations, and they need different responses:
+Read the messages as well as the exit code: downstream findings can escalate an otherwise
+safe model, and configured exit codes or acknowledged findings can change the exit status.
+These messages need different responses:
 
 | Message | What it means | What to do |
 |---|---|---|
 | "review required" | a model's columns could not be extracted | read that model's SQL yourself |
 | "columns came from the manifest, not the SQL" | the SQL was `SELECT *`, so documented columns stood in for it — on both sides, which is why the diff came out empty | give the model an explicit column list, or document its columns fully in `schema.yml` |
 | "TYPE CHANGED" | an explicit `CAST` on a column changed between revisions | decide whether the new type can hold the existing data |
+| "UNKNOWN materialization" | a materialization dbt-plan has no rule for, with no `on_schema_change` explicitly set by you; dbt's injected default does not count | set `on_schema_change` only if your materialization honours it; otherwise review by hand |
+| "REVIEW REQUIRED (materialized_view is driven by on_configuration_change, which dbt-plan does not model)" | a materialized view's schema-change behaviour is outside the prediction rules | review the adapter's `on_configuration_change` behaviour; do not add `on_schema_change` just to silence it |
+| "UNKNOWN on_schema_change" | the configured schema-change policy has no prediction rule | check the setting and review the materialization's implementation |
+| "MATERIALIZATION CHANGED" / "on_schema_change CHANGED" | the model's configuration changed between revisions | review how the new configuration treats the existing relation |
+| "BUILD FAILURE" / "BUILD_FAILURE" | schema drift meets `on_schema_change: fail`, on this model or downstream | resolve the schema drift before building |
+| "CONTRACT VIOLATION" | produced columns disagree with an enforced contract's names or explicit cast types | reconcile the SQL and the intended contract; do not disable enforcement to pass |
+| "BROKEN_REF" | downstream SQL refers to a column being removed | update the downstream reference together with the schema change |
+| "INHERITED_DROP" | an unchanged downstream `SELECT *` inherits a destructive column loss | review and coordinate the downstream drop too |
+| "INHERITED_CHANGE" | an unchanged downstream `SELECT *` inherits a change that needs review, or its columns cannot be resolved | inspect the downstream schema and materialization; unchanged SQL does not mean unchanged output |
+| "DATA_TEST_FAILURE" | a data test names a dropped column in its metadata or SQL | update the test to match the intended schema change |
+| "DATA_TEST_UNREADABLE" | a potentially affected data test has no column metadata or readable compiled SQL to inspect | compile the test and inspect its column references; this is not evidence that it passes |
+| "UNIT_TEST_FAILURE" | a unit test's `given` or `expect` fixture names a dropped column | update the fixture and expected output to match the intended change |
+| "UNIT_TEST_UNREADABLE" | a potentially affected unit test uses SQL or a fixture whose columns dbt-plan cannot inspect | review those fixture columns by hand |
+| "EXPOSURE" | a downstream dashboard or other consumer, with its owner when available; not a failure or an independent severity change | coordinate the schema change with the listed owner |
+| "SELECT * came from dbt_utils.star() returning nothing" | the macro could not find its relation when compiling | compile where the relation exists, or list the columns explicitly |
+| "target/ may be out of date" | model source files are newer than the manifest | recompile before trusting the report |
 | "not found in manifest" | the compiled SQL and the manifest disagree | the manifest is stale — recompile |
 | "the compile is incomplete" | a model in the manifest produced no compiled SQL | **fix the compile, then rerun** |
 
@@ -992,9 +2066,16 @@ These edits will silence a real finding, and none of them makes the change safe:
 - Adding columns to `schema.yml` purely to make "columns came from the manifest" go away.
   Documenting the columns is right; documenting *some* of them is what caused the problem.
   Prefer giving the model an explicit column list instead of `SELECT *`.
+- Setting `on_schema_change: ignore` on a custom materialization to clear "UNKNOWN
+  materialization". dbt-plan takes that setting at its word, so this converts an honest
+  "I do not know" into a confident "safe" without changing what the materialization does.
 
 If a destructive change is intentional, say so in the pull request. Do not edit config to
 make the warning disappear.
+
+`RELATION CHANGED` warns that database, schema, or alias moved; existing incremental history is not copied.
+
+A downstream `CONTRACT_VIOLATION` means an upstream change breaks an enforced contract, or its produced columns cannot be established.
 
 ### Why a change is judged risky
 
@@ -1002,13 +2083,14 @@ Risk is materialization crossed with `on_schema_change`:
 
 | Config | Result |
 |---|---|
-| `table` / `view` | `CREATE OR REPLACE` — safe |
-| `incremental` + `ignore` | no DDL — safe |
+| `table` / `view` | `CREATE OR REPLACE TABLE` / `CREATE OR REPLACE VIEW` — safe before downstream and contract checks |
+| `incremental` + `ignore` | NO DDL; changed or unknown columns require review |
 | `incremental` + `append_new_columns` | ADD COLUMN only — safe |
-| `incremental` + `fail` | run fails on schema drift — warning |
-| `incremental` + `sync_all_columns` | ADD and DROP COLUMN — destructive if a column was removed |
-| `snapshot` | review required — warning |
-| model deleted | destructive |
+| `incremental` + `append_new_columns`, column removed | STALE COLUMNS (not populated) — the old columns remain in the table; review their consumers |
+| `incremental` + `fail` | BUILD FAILURE on schema drift — warning |
+| `incremental` + `sync_all_columns` | ADD COLUMN and DROP COLUMN — destructive if a column was removed; column reordering alone causes no schema DDL |
+| `snapshot` | changed SQL/config in the manifest requires review — warning |
+| model deleted | MODEL REMOVED — destructive; an ephemeral model has no physical object |
 
 When dbt-plan cannot extract columns it reports "review required" rather than "safe", and
 when it never received a model at all it says so rather than staying quiet. False warnings
@@ -1019,24 +2101,36 @@ are acceptable here; a false all-clear is not.
 def _do_agent_setup(args: argparse.Namespace) -> None:
     """Write dbt-plan guidance into the project's AGENTS.md for coding agents."""
     project_dir = Path(args.project_dir)
-    path = project_dir / "AGENTS.md"
+    path = project_dir / getattr(args, "file", "AGENTS.md")
+    path.parent.mkdir(parents=True, exist_ok=True)
 
     if path.exists():
-        content = path.read_text()
+        content = path.read_text(encoding="utf-8")
         if _AGENTS_MARKER in content:
             print(
-                f"AGENTS.md already has a dbt-plan section: {path}\n"
+                f"{path.name} already has a dbt-plan section: {path}\n"
                 "Edit it directly, or delete that section and re-run 'dbt-plan agent-setup'.",
                 file=sys.stderr,
             )
-            sys.exit(2)
-        with path.open("a") as f:
+            sys.exit(ERROR_EXIT_CODE)
+        with path.open("a", encoding="utf-8") as f:
             f.write(("" if content.endswith("\n") else "\n") + "\n" + _AGENTS_GUIDE)
         print(f"Appended dbt-plan section to {path}")
     else:
-        path.write_text(f"# AGENTS.md\n\n{_AGENTS_GUIDE}")
+        path.write_text(f"# {path.name}\n\n{_AGENTS_GUIDE}", encoding="utf-8")
         print(f"Created {path}")
-    print("Coding agents that read AGENTS.md will pick this up automatically.")
+    print(f"Coding agents that read {path.name} will pick this up automatically.")
+
+
+def _is_snapshot_path(status_line: str) -> bool:
+    """True when a `git status --porcelain` line is only dbt-plan's own snapshot.
+
+    Matched as a path prefix, not a substring: someone's `models/.dbt-plan-notes.md`
+    is their work, and treating it as ours would leave it out of the stash and then
+    out of the baseline.
+    """
+    path = status_line[3:].strip().strip('"')
+    return path == SNAPSHOT_DIR.rstrip("/") or path.startswith(SNAPSHOT_DIR)
 
 
 def _do_run(args: argparse.Namespace) -> int:
@@ -1046,9 +2140,10 @@ def _do_run(args: argparse.Namespace) -> int:
     The compile command can be customized via:
       --compile-command flag, DBT_PLAN_COMPILE_COMMAND env var, or
       compile_command in .dbt-plan.yml (default: "dbt compile").
+    The dbt output directory can be customized with --target-dir (default: "target").
 
     Returns:
-        Exit code from check (0=safe, 1=destructive, 2=warning/error).
+        Exit code from check (0=safe, 1=destructive, 2=warning, 3=execution error).
     """
     import shlex
     import subprocess
@@ -1056,11 +2151,14 @@ def _do_run(args: argparse.Namespace) -> int:
     from dbt_plan.config import Config
 
     project_dir = Path(args.project_dir)
+    target_dir = getattr(args, "target_dir", "target")
     fmt = getattr(args, "format", None) or "text"
     no_color = getattr(args, "no_color", False)
     verbose = getattr(args, "verbose", False)
     dialect = getattr(args, "dialect", None)
     select = getattr(args, "select", None)
+    acknowledge = getattr(args, "acknowledge", None)
+    against = getattr(args, "against", None)
 
     # Resolve compile command: CLI flag > config (env + file)
     config = Config.load(project_dir)
@@ -1079,7 +2177,7 @@ def _do_run(args: argparse.Namespace) -> int:
             "  Check for unmatched quotes in compile_command.",
             file=sys.stderr,
         )
-        return 2
+        return ERROR_EXIT_CODE
     if not compile_argv:
         print(
             "Error: compile command is empty.\n"
@@ -1087,7 +2185,7 @@ def _do_run(args: argparse.Namespace) -> int:
             "  Examples: 'dbt compile', 'uv run dbt compile', 'poetry run dbt compile'",
             file=sys.stderr,
         )
-        return 2
+        return ERROR_EXIT_CODE
     try:
         result = subprocess.run([compile_argv[0], "--version"], capture_output=True)
     except FileNotFoundError:
@@ -1100,7 +2198,7 @@ def _do_run(args: argparse.Namespace) -> int:
             "  Examples: 'uv run dbt compile', 'poetry run dbt compile'",
             file=sys.stderr,
         )
-        return 2
+        return ERROR_EXIT_CODE
 
     _log(f"Compile command: {compile_command}")
 
@@ -1110,6 +2208,8 @@ def _do_run(args: argparse.Namespace) -> int:
             ["git", "status", "--porcelain"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             cwd=str(project_dir),
         )
     except FileNotFoundError:
@@ -1118,28 +2218,69 @@ def _do_run(args: argparse.Namespace) -> int:
             "Install git or use the manual workflow: dbt compile → dbt-plan snapshot → dbt-plan check",
             file=sys.stderr,
         )
-        return 2
+        return ERROR_EXIT_CODE
     if git_status.returncode != 0:
         print(
             "Error: not a git repository. The 'run' command uses git stash for baseline.\n"
             "Use the manual workflow instead: dbt compile → dbt-plan snapshot → dbt-plan check",
             file=sys.stderr,
         )
-        return 2
-    has_changes = bool(git_status.stdout.strip())
+        return ERROR_EXIT_CODE
+    # dbt-plan's own snapshot is not the user's work. Counting it would stash it,
+    # and the pop then collides with the snapshot this run is about to write --
+    # leaving their real changes in the stash. `snapshot` gitignores it, so this
+    # only matters when that could not be written.
+    has_changes = any(
+        line.strip() and not _is_snapshot_path(line) for line in git_status.stdout.splitlines()
+    )
 
-    # 2-4. Borrow a clean tree for the baseline; the restore is structural.
-    from dbt_plan.stash import StashError, clean_worktree
+    # 2. Say what the baseline is. Without `--against`, it is your last commit --
+    # so a change you already committed is not in the comparison at all, and the
+    # only way to notice used to be reading the source.
+    from dbt_plan.stash import CheckoutError, StashError, borrowed_head, clean_worktree, merge_base
 
+    baseline_ref = None
+    if against:
+        try:
+            baseline_ref = merge_base(project_dir, against)
+        except CheckoutError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return ERROR_EXIT_CODE
+        _log(f"Baseline: where this branch left {against} ({baseline_ref[:12]})")
+    else:
+        head = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(project_dir),
+        )
+        head_id = head.stdout.strip() or "HEAD"
+        _log(
+            f"Baseline: your last commit ({head_id}). Anything already committed on "
+            f"this branch is not compared -- pass --against main for that."
+        )
+
+    # 3-4. Borrow a clean tree, and HEAD if asked. Both restores are structural,
+    # and HEAD comes back before the stash is popped so the work lands on the
+    # tree it came from.
     if has_changes:
         _log("Stashing uncommitted changes...")
     try:
-        with clean_worktree(project_dir, has_changes=has_changes) as stash:
-            _log("Compiling baseline (current branch HEAD)...")
+        # Order matters, and `with` gives it for free: borrowed_head exits first,
+        # so HEAD is back before the stash is popped.
+        with (
+            clean_worktree(project_dir, has_changes=has_changes) as stash,
+            borrowed_head(project_dir, baseline_ref),
+        ):
+            _log("Compiling baseline...")
             compile_base = subprocess.run(
                 compile_argv,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 cwd=str(project_dir),
             )
             if compile_base.returncode != 0:
@@ -1147,28 +2288,31 @@ def _do_run(args: argparse.Namespace) -> int:
                     f"Error: compile failed for baseline:\n{compile_base.stderr}",
                     file=sys.stderr,
                 )
-                return 2
+                return ERROR_EXIT_CODE
 
             _log("Saving snapshot...")
-            snapshot_args = argparse.Namespace(
-                project_dir=str(project_dir),
-                target_dir="target",
-            )
-            _do_snapshot(snapshot_args)
+            _do_snapshot(argparse.Namespace(project_dir=str(project_dir), target_dir=target_dir))
         if stash.stashed and not stash.restore_failed:
             _log("Restored your changes.")
+    except CheckoutError as e:
+        print(
+            f"Error: could not check out the baseline: {e}\n"
+            "  Your working tree and HEAD are where you left them.",
+            file=sys.stderr,
+        )
+        return ERROR_EXIT_CODE
     except StashError as e:
         print(
             "Error: could not stash your uncommitted changes, so a clean "
             f"baseline cannot be compiled:\n{e}\n"
-            "  Your working tree is untouched. Commit or stash manually, or use\n"
+            "  Check git status and any recovery instructions above before retrying, or use\n"
             "  the manual workflow: dbt compile -> dbt-plan snapshot -> dbt-plan check",
             file=sys.stderr,
         )
-        return 2
+        return ERROR_EXIT_CODE
 
     if stash.restore_failed:
-        return 2
+        return ERROR_EXIT_CODE
 
     # 5. Compile current state
     _log("Compiling current state...")
@@ -1176,6 +2320,8 @@ def _do_run(args: argparse.Namespace) -> int:
         compile_argv,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         cwd=str(project_dir),
     )
     if compile_curr.returncode != 0:
@@ -1183,13 +2329,13 @@ def _do_run(args: argparse.Namespace) -> int:
             f"Error: compile failed for current:\n{compile_curr.stderr}",
             file=sys.stderr,
         )
-        return 2
+        return ERROR_EXIT_CODE
 
     # 6. Run check
     _log("Checking for DDL risks...")
     check_args = argparse.Namespace(
         project_dir=str(project_dir),
-        target_dir="target",
+        target_dir=target_dir,
         base_dir=".dbt-plan/base",
         manifest=None,
         format=fmt,
@@ -1197,14 +2343,16 @@ def _do_run(args: argparse.Namespace) -> int:
         verbose=verbose,
         dialect=dialect,
         select=select,
+        acknowledge=acknowledge,
     )
     return _do_check(check_args)
 
 
-def main() -> None:
+def _main() -> None:
+    _configure_output_streams()
     from dbt_plan import __version__
 
-    parser = argparse.ArgumentParser(
+    parser = _ArgumentParser(
         prog="dbt-plan",
         description="Static analysis tool that warns about risky DDL changes before dbt run",
         epilog=(
@@ -1224,9 +2372,10 @@ def main() -> None:
             "  dbt-plan agent-setup       # tell coding agents how to use dbt-plan\n"
             "\n"
             "exit codes:\n"
-            "  0  all changes are safe\n"
+            "  0  no blocking findings under the configured policy\n"
             "  1  destructive changes detected\n"
-            "  2  warning or error (parse failure, missing files)\n"
+            "  2  review needed (SQL uncertainty or potential build failure)\n"
+            "  3  execution failed (invalid input, compile failure, internal error)\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1274,7 +2423,11 @@ def main() -> None:
         "-s",
         "--select",
         default=None,
-        help="Only check specific models (comma-separated, like dbt --select)",
+        help=(
+            "Union of comma-separated model names; optional '+' includes upstream "
+            "and/or downstream. Use explicit version names (fct_orders_v2). "
+            "Unsupported syntax and unknown names exit 3."
+        ),
     )
     check.add_argument(
         "--acknowledge",
@@ -1296,7 +2449,10 @@ def main() -> None:
     check.add_argument(
         "--dialect",
         default=None,
-        help="SQL dialect for parsing (default: snowflake). Supports any sqlglot dialect.",
+        help=(
+            "SQL dialect for parsing. Defaults to the manifest's adapter_type, "
+            "then snowflake. Supports any sqlglot dialect."
+        ),
     )
 
     # init
@@ -1317,9 +2473,18 @@ def main() -> None:
         help="Path to manifest.json (default: {target-dir}/manifest.json)",
     )
     stats_cmd.add_argument(
+        "--format",
+        choices=["text", "json"],
+        default="text",
+        help="Output format: text (terminal), json (programmatic)",
+    )
+    stats_cmd.add_argument(
         "--dialect",
         default=None,
-        help="SQL dialect for parsing (default: snowflake). Supports any sqlglot dialect.",
+        help=(
+            "SQL dialect for parsing. Defaults to the manifest's adapter_type, "
+            "then snowflake. Supports any sqlglot dialect."
+        ),
     )
 
     # ci-setup
@@ -1334,12 +2499,21 @@ def main() -> None:
     )
     agent_cmd.add_argument("--project-dir", default=".", help="dbt project directory (default: .)")
 
+    agent_cmd.add_argument(
+        "--file",
+        default="AGENTS.md",
+        help="Instruction file to append or create (default: AGENTS.md)",
+    )
+
     # run
     run_cmd = subparsers.add_parser(
         "run",
         help="One-command check: compile baseline → compile current → check (requires dbt)",
     )
     run_cmd.add_argument("--project-dir", default=".", help="dbt project directory (default: .)")
+    run_cmd.add_argument(
+        "--target-dir", default="target", help="dbt target directory (default: target)"
+    )
     run_cmd.add_argument(
         "--format",
         choices=["text", "github", "json"],
@@ -1353,10 +2527,34 @@ def main() -> None:
         help="Disable colored output",
     )
     run_cmd.add_argument(
+        "--against",
+        default=None,
+        metavar="REF",
+        help=(
+            "Compare against where this branch left REF, rather than your last commit. "
+            "`--against main` is what 'before you push' usually means: without it, "
+            "anything you have already committed is not in the comparison."
+        ),
+    )
+    run_cmd.add_argument(
         "-s",
         "--select",
         default=None,
-        help="Only check specific models (comma-separated)",
+        help=(
+            "Union of comma-separated model names; optional '+' includes upstream "
+            "and/or downstream. Use explicit version names (fct_orders_v2). "
+            "Unsupported syntax and unknown names exit 3."
+        ),
+    )
+    run_cmd.add_argument(
+        "--acknowledge",
+        default=None,
+        metavar="MODELS",
+        help=(
+            "Comma-separated models whose destructive change has been reviewed. "
+            "They are still reported, but stop failing the build. "
+            "Also settable via DBT_PLAN_ACKNOWLEDGE or acknowledge_models in .dbt-plan.yml"
+        ),
     )
     run_cmd.add_argument(
         "-v",
@@ -1368,7 +2566,7 @@ def main() -> None:
     run_cmd.add_argument(
         "--dialect",
         default=None,
-        help="SQL dialect for parsing (default: snowflake)",
+        help="SQL dialect for parsing (default: the manifest's adapter_type)",
     )
     run_cmd.add_argument(
         "--compile-command",
@@ -1397,6 +2595,22 @@ def main() -> None:
         _do_ci_setup(args)
     elif args.command == "run":
         sys.exit(_do_run(args))
+
+
+def main() -> None:
+    """Keep operational and unexpected failures outside the verdict code space.
+
+    Exception deliberately excludes SystemExit and KeyboardInterrupt. Context
+    managers in run unwind before this boundary, preserving recovery behavior.
+    """
+    try:
+        _main()
+    except ConfigError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(ERROR_EXIT_CODE)
+    except Exception as exc:
+        print(f"Error: dbt-plan could not complete ({type(exc).__name__}): {exc}", file=sys.stderr)
+        sys.exit(ERROR_EXIT_CODE)
 
 
 if __name__ == "__main__":

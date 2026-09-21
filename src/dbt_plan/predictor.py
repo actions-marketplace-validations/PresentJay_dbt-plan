@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
+
+from dbt_plan.manifest import model_key
 
 
 class Safety(Enum):
@@ -24,13 +27,41 @@ class DDLOperation:
 
 @dataclass(frozen=True)
 class DownstreamImpact:
-    """Predicted impact on a downstream model."""
+    """Predicted impact on a downstream node.
+
+    Usually a model. Unit tests reuse this with `materialization="unit_test"`,
+    because what they need reporting -- a name, a risk and a reason -- is the
+    same three things, and neither field below is rendered anywhere.
+    """
 
     model_name: str
     materialization: str
     on_schema_change: str | None
-    risk: str  # "build_failure", "broken_ref"
+    risk: str  # a key of RISK_SAFETY
     reason: str  # human-readable explanation
+
+
+# What each cascade risk is worth on its own. The formatter colours by this and
+# the escalation in analyze_cascade_impacts reads it, so a risk added to only
+# one of the two is how a red finding ends up wearing a yellow icon.
+RISK_SAFETY: dict[str, Safety] = {
+    "broken_ref": Safety.DESTRUCTIVE,
+    "build_failure": Safety.WARNING,
+    "unit_test_failure": Safety.WARNING,
+    "unit_test_unreadable": Safety.WARNING,
+    "inherited_drop": Safety.DESTRUCTIVE,
+    "inherited_change": Safety.WARNING,
+    "data_test_failure": Safety.WARNING,
+    "data_test_unreadable": Safety.WARNING,
+    "contract_violation": Safety.WARNING,
+}
+
+_SAFETY_RANK = {Safety.SAFE: 0, Safety.WARNING: 1, Safety.DESTRUCTIVE: 2}
+
+
+def worst_safety(safeties: list[Safety]) -> Safety:
+    """The most severe of several verdicts. Cascade escalates, never downgrades."""
+    return max(safeties, key=_SAFETY_RANK.__getitem__)
 
 
 @dataclass(frozen=True)
@@ -45,6 +76,25 @@ class DDLPrediction:
     columns_added: list[str] = field(default_factory=list)
     columns_removed: list[str] = field(default_factory=list)
     downstream_impacts: list[DownstreamImpact] = field(default_factory=list)
+    # Not a finding of its own -- see attach_downstream_exposures.
+    downstream_exposures: list = field(default_factory=list)
+
+
+def _column_diff(
+    base_columns: list[str] | None, current_columns: list[str] | None
+) -> tuple[list[str], list[str]]:
+    """(added, removed), or two empty lists when either side is not a column set.
+
+    A `["*"]` or `["* except(...)"]` sentinel stands for columns dbt-plan could not
+    enumerate. Differencing it yields entries like `DROP COLUMN *`, which reads as
+    a finding and is not one.
+    """
+    if not base_columns or not current_columns:
+        return [], []
+    if base_columns[0].startswith("*") or current_columns[0].startswith("*"):
+        return [], []
+    base_set, current_set = set(base_columns), set(current_columns)
+    return sorted(current_set - base_set), sorted(base_set - current_set)
 
 
 def predict_ddl(
@@ -59,7 +109,9 @@ def predict_ddl(
 
     Args:
         model_name: dbt model name.
-        materialization: "table", "view", "incremental", "ephemeral".
+        materialization: "table", "view", "incremental", "ephemeral",
+            "snapshot". Anything else is reported as unknown rather than
+            being treated as incremental.
         on_schema_change: "ignore", "fail", "append_new_columns",
                           "sync_all_columns", or None.
         base_columns: Columns from base (None if parse failed).
@@ -114,18 +166,86 @@ def predict_ddl(
         )
 
     if materialization == "snapshot":
-        # dbt snapshots use CREATE TABLE IF NOT EXISTS + MERGE
-        # Schema changes are not auto-managed, so warn for review
+        # dbt snapshots use CREATE TABLE IF NOT EXISTS + MERGE. Schema changes are
+        # not auto-managed, so the verdict stays review -- but the column diff is
+        # already computed, and "review required" with nothing attached does not
+        # tell a reviewer what to go and look at.
+        snapshot_added, snapshot_removed = _column_diff(base_columns, current_columns)
         return DDLPrediction(
             model_name=model_name,
             materialization=materialization,
             on_schema_change=on_schema_change,
             safety=Safety.WARNING,
-            operations=[DDLOperation("REVIEW REQUIRED (snapshot)")],
+            operations=[
+                DDLOperation("REVIEW REQUIRED (snapshot)"),
+                *[DDLOperation("ADD COLUMN", col) for col in snapshot_added],
+                *[DDLOperation("DROP COLUMN", col) for col in snapshot_removed],
+            ],
+            columns_added=snapshot_added,
+            columns_removed=snapshot_removed,
+        )
+
+    if materialization != "incremental" and on_schema_change is None:
+        # Everything dbt ships is handled above except incremental, so this is a
+        # materialized view, an adapter-specific object like a Snowflake dynamic
+        # table, or a custom materialization -- and nobody has said how it treats
+        # a schema change.
+        #
+        # An explicit on_schema_change is an assertion by the author about how
+        # their materialization behaves, and honouring it is more useful than
+        # refusing: a custom materialization set to sync_all_columns still earns
+        # a DESTRUCTIVE verdict below. Its *absence* asserts nothing, and
+        # defaulting it to "ignore" is what produced the false all-clear -- a
+        # materialized view dropping a column reported SAFE / NO DDL, from a
+        # setting that does not govern materialized views at all.
+        if materialization == "materialized_view":
+            reason = (
+                "REVIEW REQUIRED (materialized_view is driven by "
+                "on_configuration_change, which dbt-plan does not model)"
+            )
+        else:
+            reason = f"UNKNOWN materialization: {materialization}"
+
+        unknown_added, unknown_removed = _column_diff(base_columns, current_columns)
+        return DDLPrediction(
+            model_name=model_name,
+            materialization=materialization,
+            on_schema_change=on_schema_change,
+            safety=Safety.WARNING,
+            operations=[
+                DDLOperation(reason),
+                # Carry the diff anyway: "unknown" with nothing attached tells a
+                # reviewer nothing about what to go and look at.
+                *[DDLOperation("ADD COLUMN", col) for col in unknown_added],
+                *[DDLOperation("DROP COLUMN", col) for col in unknown_removed],
+            ],
+            columns_added=unknown_added,
+            columns_removed=unknown_removed,
         )
 
     # Incremental: depends on on_schema_change
     osc = on_schema_change or "ignore"
+
+    if osc == "ignore" and status != "added":
+        if (
+            base_columns is None
+            or current_columns is None
+            or any(col.startswith("*") for col in [*base_columns, *current_columns])
+        ):
+            operation = "REVIEW REQUIRED: cannot determine incremental schema changes"
+        elif set(base_columns) - set(current_columns):
+            operation = "BUILD FAILURE RISK: removed columns remain in the target under on_schema_change=ignore"
+        elif set(current_columns) - set(base_columns):
+            operation = "REVIEW REQUIRED: added columns are not written to the target under on_schema_change=ignore; downstream readers may fail"
+        else:
+            operation = "NO DDL"
+        return DDLPrediction(
+            model_name=model_name,
+            materialization=materialization,
+            on_schema_change=osc,
+            safety=Safety.SAFE if operation == "NO DDL" else Safety.WARNING,
+            operations=[DDLOperation(operation)],
+        )
 
     if osc == "ignore":
         return DDLPrediction(
@@ -262,12 +382,7 @@ def predict_ddl(
         ops += [DDLOperation("DROP COLUMN", col) for col in removed]
         safety = Safety.DESTRUCTIVE if removed else Safety.SAFE
 
-        # Detect column reordering: sync_all_columns drops + re-adds
-        # columns to match the new order even when the column set is unchanged
-        if not added and not removed and base_columns != current_columns:
-            ops = [DDLOperation("COLUMNS REORDERED")]
-            safety = Safety.WARNING
-
+        # dbt compares column sets; projection order alone does not cause DDL.
         return DDLPrediction(
             model_name=model_name,
             materialization=materialization,
@@ -288,6 +403,270 @@ def predict_ddl(
     )
 
 
+def _column_patterns(lost_by_model: dict[str, list[str]]) -> dict[str, re.Pattern]:
+    """Word-boundary patterns for every column being removed, compiled once."""
+    return {
+        col: re.compile(r"\b" + re.escape(col) + r"\b", re.IGNORECASE)
+        for columns in lost_by_model.values()
+        for col in columns
+    }
+
+
+def _unit_test_impacts(
+    lost_by_model: dict[str, list[str]],
+    owner_node_ids: list[str],
+    child_map: dict[str, list[str]],
+    unit_test_index: dict,
+) -> list[DownstreamImpact]:
+    """Report unit tests whose hand-written fixtures name a column being removed.
+
+    dbt validates every fixture's column names against the real relation it stands
+    for, so a dropped column fails the test at `dbt build` -- as an `expect` block
+    on the model losing the column, and as a `given` input anywhere downstream that
+    supplies that model's rows.
+
+    `lost_by_model` maps a model name to the columns it is losing, whether from its
+    own diff or inherited through a `SELECT *`. Only fixtures standing in for a
+    model in that map are compared: those are the only columns known to move.
+
+    A unit test hangs off the model it tests as a direct child, so the changed model
+    plus its downstream set covers every one of them with no second walk.
+    """
+    impacts: list[DownstreamImpact] = []
+    seen: set[str] = set()
+    for owner_nid in owner_node_ids:
+        for child in child_map.get(owner_nid) or []:
+            if child in seen:
+                continue
+            unit_test = unit_test_index.get(child)
+            if unit_test is None:
+                continue
+            seen.add(child)
+            for fixture in unit_test.fixtures:
+                removed = lost_by_model.get(fixture.model)
+                if not removed:
+                    continue
+                if fixture.columns is None:
+                    impacts.append(
+                        DownstreamImpact(
+                            model_name=unit_test.name,
+                            materialization="unit_test",
+                            on_schema_change=None,
+                            risk="unit_test_unreadable",
+                            reason=(
+                                f"{fixture.label} {fixture.unreadable_reason}, so dbt-plan "
+                                f"cannot tell whether it names the dropped column(s)"
+                            ),
+                        )
+                    )
+                    continue
+                named = sorted(col for col in removed if col.lower() in fixture.columns)
+                if named:
+                    impacts.append(
+                        DownstreamImpact(
+                            model_name=unit_test.name,
+                            materialization="unit_test",
+                            on_schema_change=None,
+                            risk="unit_test_failure",
+                            reason=f"{fixture.label} names dropped column(s): {', '.join(named)}",
+                        )
+                    )
+    return impacts
+
+
+def _inherited_impact(
+    ds_node,
+    base_columns_of: Callable[[str], list[str] | None],
+    current_columns_of: Callable[[str], list[str] | None],
+    changed_models: dict[str, str],
+) -> tuple[DownstreamImpact | None, list[str]]:
+    """Predict what happens to a downstream model whose own file did not change.
+
+    `select * from {{ ref(x) }}` compiles to the same bytes before and after x
+    loses a column, so the diff has no entry for it and dbt-plan used to say
+    nothing -- while dbt, on `incremental` + `sync_all_columns`, issues a
+    DROP COLUMN against a table that has data in it.
+
+    Both sides are resolved through `ref()` from the project's own compiled SQL
+    and run back through predict_ddl, so the verdict follows the same
+    materialization rules as any other model rather than a second set invented
+    here. A model whose columns cannot be read on both sides is still put through
+    predict_ddl, which answers REVIEW REQUIRED where the configuration allows a
+    drop and SAFE where it cannot -- silence would be the wrong answer, and so
+    would a guess.
+
+    Returns (impact, lost). The impact is None when there is nothing to report --
+    the model has its own entry in the diff already, or its own verdict comes back
+    safe -- but `lost` is filled in either way, because a downstream model can lose
+    a column safely and still break the data tests that read it.
+    """
+    if ds_node.name in changed_models:
+        return None, []  # it changed on its own; it has a verdict of its own
+
+    ds_base = base_columns_of(ds_node.name)
+    ds_current = current_columns_of(ds_node.name)
+    lost = sorted(set(ds_base) - set(ds_current)) if ds_base and ds_current else []
+    if ds_base is not None and ds_current is not None and not lost:
+        return None, []  # resolved on both sides and losing nothing
+
+    ds_pred = predict_ddl(
+        model_name=ds_node.name,
+        materialization=ds_node.materialization,
+        on_schema_change=ds_node.on_schema_change,
+        base_columns=ds_base,
+        current_columns=ds_current,
+        status="modified",
+    )
+    if ds_pred.safety == Safety.SAFE:
+        return None, lost
+
+    detail = (
+        f"loses {', '.join(lost)} from upstream"
+        if lost
+        else "its columns cannot be resolved on both sides"
+    )
+    operations = ", ".join(
+        f"{op.operation} {op.column or ''}".strip() for op in ds_pred.operations
+    )
+    return (
+        DownstreamImpact(
+            model_name=ds_node.name,
+            materialization=ds_node.materialization,
+            on_schema_change=ds_node.on_schema_change,
+            risk="inherited_drop" if ds_pred.safety == Safety.DESTRUCTIVE else "inherited_change",
+            reason=f"file unchanged, {detail} -- {operations or ds_pred.safety.value}",
+        ),
+        lost,
+    )
+
+
+def _data_test_impacts(
+    lost_by_model: dict[str, list[str]],
+    owner_node_ids: list[str],
+    child_map: dict[str, list[str]],
+    data_test_index: dict,
+    test_sql_index: dict[str, Path],
+) -> list[DownstreamImpact]:
+    """Report data tests that read a column being removed.
+
+    A `not_null` on a dropped column is not a failing assertion, it is a broken
+    query -- dbt cannot even bind it:
+
+        Binder Error: Referenced column "customer_id" not found in FROM clause!
+
+    A generic test names its primary column in the manifest. When it also has
+    predicates or custom arguments, that list is incomplete. Its compiled SQL,
+    like a singular test's SQL, is searched for the dropped names -- the same check `broken_ref` runs against
+    a downstream model, and it reads only the current side for the same reason:
+    the question is what the SQL names, not whether the file changed.
+
+    Data tests hang off every model they read as a direct child, so the changed
+    model plus its downstream set covers them with no second walk.
+    """
+    impacts: list[DownstreamImpact] = []
+    seen: set[str] = set()
+    patterns = _column_patterns(lost_by_model)
+    for owner_nid in owner_node_ids:
+        for child in child_map.get(owner_nid) or []:
+            if child in seen:
+                continue
+            data_test = data_test_index.get(child)
+            if data_test is None:
+                continue
+            seen.add(child)
+
+            named = sorted(
+                col
+                for model, declared in data_test.columns_by_model.items()
+                for col in lost_by_model.get(model) or []
+                if col.lower() in declared
+            )
+            if named:
+                impacts.append(
+                    DownstreamImpact(
+                        model_name=data_test.name,
+                        materialization="data_test",
+                        on_schema_change=None,
+                        risk="data_test_failure",
+                        reason=f"tests dropped column(s): {', '.join(named)}",
+                    )
+                )
+                continue
+
+            # Models this test reads that the manifest says nothing about, column
+            # wise: a singular test, or a generic one with no column_name.
+            undescribed = [
+                model
+                for model in data_test.depends_on_models
+                if lost_by_model.get(model)
+                and (model not in data_test.columns_by_model or data_test.requires_sql)
+            ]
+            if not undescribed:
+                continue
+
+            sql = None
+            sql_path = test_sql_index.get(data_test.name)
+            if sql_path is not None:
+                try:
+                    sql = sql_path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    sql = None
+            if sql is None:
+                impacts.append(
+                    DownstreamImpact(
+                        model_name=data_test.name,
+                        materialization="data_test",
+                        on_schema_change=None,
+                        risk="data_test_unreadable",
+                        reason=(
+                            "the manifest does not describe every column read and compiled SQL was not "
+                            "found, so dbt-plan cannot tell whether it reads the dropped "
+                            "column(s)"
+                        ),
+                    )
+                )
+                continue
+            in_sql = sorted(
+                {
+                    col
+                    for model in undescribed
+                    for col in lost_by_model[model]
+                    if patterns[col].search(sql)
+                }
+            )
+            if in_sql:
+                impacts.append(
+                    DownstreamImpact(
+                        model_name=data_test.name,
+                        materialization="data_test",
+                        on_schema_change=None,
+                        risk="data_test_failure",
+                        reason=f"its SQL names dropped column(s): {', '.join(in_sql)}",
+                    )
+                )
+    return impacts
+
+
+def has_ddl_rule(materialization: str, on_schema_change: str | None) -> bool:
+    """Whether predict_ddl has a rule for this pair, or only ever defers to review.
+
+    Derived by asking predict_ddl about a canned single-column removal rather than
+    restating the rules table, so the two cannot drift apart. `dbt-plan stats` used
+    to restate it, got `append_new_columns` wrong, and never learned that a
+    materialization with no `on_schema_change` had become a warning.
+    """
+    prediction = predict_ddl(
+        model_name="",
+        materialization=materialization,
+        on_schema_change=on_schema_change,
+        base_columns=["a", "b"],
+        current_columns=["a"],
+    )
+    return not any(
+        op.operation.startswith(("REVIEW REQUIRED", "UNKNOWN")) for op in prediction.operations
+    )
+
+
 def analyze_cascade_impacts(
     predictions: list[DDLPrediction],
     model_node_ids: dict[str, str],
@@ -296,8 +675,15 @@ def analyze_cascade_impacts(
     node_index: dict,
     base_node_index: dict,
     compiled_sql_index: dict[str, Path],
+    child_map: dict[str, list[str]] | None = None,
+    unit_test_index: dict | None = None,
+    data_test_index: dict | None = None,
+    test_sql_index: dict[str, Path] | None = None,
+    base_columns_of: Callable[[str], list[str] | None] | None = None,
+    current_columns_of: Callable[[str], list[str] | None] | None = None,
+    columns_read_of: Callable[[str, str], list[str] | None] | None = None,
 ) -> tuple[list[DDLPrediction], dict[str, list[str]]]:
-    """Analyze cascade impacts of column changes on downstream models.
+    """Analyze cascade impacts of column changes on downstream nodes.
 
     Args:
         predictions: DDL predictions for changed models.
@@ -307,10 +693,25 @@ def analyze_cascade_impacts(
         node_index: current manifest model node lookup (name → ModelNode).
         base_node_index: base manifest model node lookup (name → ModelNode).
         compiled_sql_index: model_name → Path to compiled SQL file.
+        child_map: manifest child_map, needed to reach non-model children.
+        unit_test_index: node_id → UnitTestNode. Omitted, unit tests are skipped.
+        data_test_index: node_id → DataTestNode. Omitted, data tests are skipped.
+        test_sql_index: test name → compiled SQL, for tests the manifest does not
+            describe by column.
+        base_columns_of, current_columns_of: resolve a model name to its columns
+            on each side, following `ref()` so a `SELECT *` expands. Omitted, the
+            unchanged-file check below is skipped.
+        columns_read_of: (downstream model, changed model) → the columns the first
+            reads from the second, or None when that cannot be resolved. Omitted or
+            refusing, the broken-ref check falls back to searching the text.
 
     Returns:
         (updated_predictions, downstream_map)
     """
+    child_map = child_map or {}
+    unit_test_index = unit_test_index or {}
+    data_test_index = data_test_index or {}
+    test_sql_index = test_sql_index or {}
     updated = list(predictions)
     downstream_map: dict[str, list[str]] = {}
 
@@ -319,19 +720,18 @@ def analyze_cascade_impacts(
         if not node_id:
             continue
         downstream_nids = all_downstream.get(node_id, [])
-        if not downstream_nids:
-            continue
+        # A model with nothing downstream still carries its own unit tests, so
+        # this does not return early -- only the report line is skipped.
+        if downstream_nids:
+            downstream_map[pred.model_name] = [model_key(nid) for nid in downstream_nids]
 
-        downstream_names = [nid.split(".")[-1] for nid in downstream_nids]
-        downstream_map[pred.model_name] = downstream_names
-
-        # Skip cascade for incremental+ignore: no physical schema change occurs,
-        # so downstream models are not affected by column changes in the SQL
-        if (
+        # incremental+ignore alters nothing physical, so nothing downstream of
+        # it moves. Its own unit tests still do: they run the model's SELECT
+        # against fixtures, not the merge, so they see the dropped column.
+        ignore_incremental = (
             pred.materialization == "incremental"
             and (pred.on_schema_change or "ignore") == "ignore"
-        ):
-            continue
+        )
 
         # Compute SQL-level column diff for cascade analysis
         # (predictor doesn't populate columns_removed for table/view,
@@ -356,32 +756,33 @@ def analyze_cascade_impacts(
         if not cascade_removed and not cascade_added:
             continue
 
-        # Pre-compile regex patterns for column matching (avoid per-iteration compile)
-        col_patterns = (
-            {
-                col: re.compile(r"\b" + re.escape(col) + r"\b", re.IGNORECASE)
-                for col in cascade_removed
-            }
-            if cascade_removed
-            else {}
+        # Every model this change removes a column from, keyed by name: the changed
+        # model, plus any downstream one that inherits the loss through a SELECT *.
+        # The tests are checked against the whole map in one pass at the end, so a
+        # test is only ever compared with the columns of the model it actually reads.
+        lost_by_model: dict[str, list[str]] = (
+            {pred.model_name: cascade_removed} if cascade_removed else {}
         )
 
+        downstream_to_check = [] if ignore_incremental else downstream_nids
         impacts: list[DownstreamImpact] = []
-        for ds_nid in downstream_nids:
-            ds_node = node_index.get(ds_nid.split(".")[-1])
-            if not ds_node:
-                ds_node = base_node_index.get(ds_nid.split(".")[-1])
+        # Pass 1: what each downstream model becomes. Build failures on
+        # on_schema_change=fail, and models that lose a column they never named
+        # because they select * from one that did. This fills lost_by_model, and
+        # pass 2 needs the whole map -- a model two hops away reads the column from
+        # the passthrough, not from the model that changed.
+        ds_nodes = []
+        for ds_nid in downstream_to_check:
+            ds_key = model_key(ds_nid)
+            ds_node = node_index.get(ds_key) or base_node_index.get(ds_key)
             if not ds_node:
                 continue
+            # Ephemeral has no DDL, but its output still feeds tests and models.
+            if ds_node.materialization != "ephemeral":
+                ds_nodes.append(ds_node)
 
             ds_mat = ds_node.materialization
             ds_osc = ds_node.on_schema_change or "ignore"
-
-            # ephemeral: CTE substitution, no physical table — always safe
-            if ds_mat == "ephemeral":
-                continue
-
-            # incremental + fail: guaranteed build failure on any schema change
             if ds_mat == "incremental" and ds_osc == "fail" and (cascade_added or cascade_removed):
                 impacts.append(
                     DownstreamImpact(
@@ -392,45 +793,241 @@ def analyze_cascade_impacts(
                         reason="upstream schema changed, on_schema_change=fail",
                     )
                 )
-                # Don't continue — also check for broken column refs below
 
-            # Check for broken column references in downstream SQL
-            # Applies to ALL materialization types (table/view/incremental):
-            # even though table/view DDL is safe (CREATE OR REPLACE),
-            # the SELECT will fail if it references a dropped upstream column
-            if col_patterns:
-                ds_sql_path = compiled_sql_index.get(ds_node.name)
+            if cascade_removed and base_columns_of and current_columns_of:
+                inherited, ds_lost = _inherited_impact(
+                    ds_node, base_columns_of, current_columns_of, changed_models=model_node_ids
+                )
+                if inherited is not None:
+                    impacts.append(inherited)
+                if ds_lost:
+                    # It may lose the column harmlessly -- a table is rebuilt -- and
+                    # still break every model and test that reads it from there.
+                    lost_by_model[ds_node.name] = ds_lost
+
+        # Pass 2: who reads a column that is going away, from whichever model it is
+        # going away from. Checked against every model in lost_by_model, not only the
+        # one that changed: `fct` reading `customer_id` from `mid`, which reads `*`
+        # from `stg`, breaks when `stg` drops it, and `fct` never mentions `stg`.
+        # The text search caught that by accident, matching the name anywhere; the
+        # resolved reader only answers about the relation it is asked about, so it
+        # has to be asked about each one.
+        # A downstream model that is itself being removed cannot break. Its compiled
+        # SQL is still on disk -- dbt compile never removes it -- so without this it
+        # would be reported as reading a column that is going away, from a model that
+        # is going away with it.
+        removed_models = {
+            name
+            for name, (base, current) in model_cols.items()
+            if base is not None and current is None
+        }
+        if lost_by_model:
+            patterns = _column_patterns(lost_by_model)
+            for ds_node in ds_nodes:
+                if ds_node.name in removed_models:
+                    continue
+                ds_mat = ds_node.materialization
+                ds_osc = ds_node.on_schema_change or "ignore"
+                broken: dict[str, None] = {}
+                fell_back = False
                 ds_sql = None
+                ds_sql_path = compiled_sql_index.get(ds_node.name)
                 if ds_sql_path:
                     try:
-                        ds_sql = ds_sql_path.read_text()
+                        ds_sql = ds_sql_path.read_text(encoding="utf-8")
                     except (OSError, UnicodeDecodeError):
-                        pass  # unreadable file — skip broken_ref check for this model
+                        ds_sql = None  # unreadable file -- the text search is skipped too
 
-                if ds_sql:
-                    broken_refs = [
-                        col for col, pattern in col_patterns.items() if pattern.search(ds_sql)
-                    ]
-                    if broken_refs:
-                        impacts.append(
-                            DownstreamImpact(
-                                model_name=ds_node.name,
-                                materialization=ds_mat,
-                                on_schema_change=ds_osc,
-                                risk="broken_ref",
-                                reason=f"references dropped column(s): {', '.join(broken_refs)}",
-                            )
+                for lost_model, removed in lost_by_model.items():
+                    if lost_model == ds_node.name:
+                        continue
+                    # Resolving the reference beats searching for the name: the text
+                    # search fires on a comment, a string literal, and any column of
+                    # the same name on a different table. It stays as the fallback,
+                    # because a refusal must widen what gets reported, never narrow it.
+                    read = columns_read_of(ds_node.name, lost_model) if columns_read_of else None
+                    if read is not None:
+                        for col in removed:
+                            if col.lower() in read:
+                                broken[col] = None
+                    elif ds_sql:
+                        fell_back = True
+                        for col in removed:
+                            if patterns[col].search(ds_sql):
+                                broken[col] = None
+
+                if broken:
+                    verb = "references" if fell_back else "reads"
+                    impacts.append(
+                        DownstreamImpact(
+                            model_name=ds_node.name,
+                            materialization=ds_mat,
+                            on_schema_change=ds_osc,
+                            risk="broken_ref",
+                            reason=f"{verb} dropped column(s): {', '.join(broken)}",
                         )
+                    )
+
+        test_owners = [node_id, *downstream_to_check]
+        impacts += _unit_test_impacts(lost_by_model, test_owners, child_map, unit_test_index)
+        impacts += _data_test_impacts(
+            lost_by_model, test_owners, child_map, data_test_index, test_sql_index
+        )
 
         if impacts:
-            # Escalate safety based on cascade risk
-            cascade_safety = pred.safety
-            if any(imp.risk == "broken_ref" for imp in impacts):
-                cascade_safety = Safety.DESTRUCTIVE
-            elif any(imp.risk == "build_failure" for imp in impacts):
-                if cascade_safety == Safety.SAFE:
-                    cascade_safety = Safety.WARNING
-
+            # Escalate to the worst risk found; cascade never downgrades a verdict.
+            cascade_safety = worst_safety(
+                [pred.safety, *(RISK_SAFETY.get(imp.risk, Safety.WARNING) for imp in impacts)]
+            )
             updated[i] = replace(pred, safety=cascade_safety, downstream_impacts=impacts)
 
     return updated, downstream_map
+
+
+def attach_downstream_exposures(
+    predictions: list[DDLPrediction],
+    model_node_ids: dict[str, str],
+    all_downstream: dict[str, list[str]],
+    child_map: dict[str, list[str]],
+    exposure_index: dict,
+    model_cols: dict[str, tuple[list[str] | None, list[str] | None]] | None = None,
+) -> list[DDLPrediction]:
+    """Name exposures downstream of unsafe changes or known SQL column losses.
+
+    An exposure records that something outside the project -- a dashboard, a
+    notebook, a reverse-ETL sync -- reads a model, and it declares that at model
+    granularity. There are no columns in one, so this can never claim a dashboard
+    breaks: only that its owner is downstream of a change that is not safe.
+
+    Deliberately not a risk and deliberately not an escalation. An exposure
+    existing does not make a change more dangerous, and inflating the verdict for
+    it would train people to ignore the line. Safe replacements are included only
+    when the SQL column diff proves a loss; additions and unchanged sets stay quiet.
+    `model_cols` carries that SQL diff even when the DDL prediction needs no ALTER.
+
+    Exposures hang off every model they depend on as a direct child, so the
+    changed model plus its downstream set covers them with no extra walk.
+    """
+    if not exposure_index:
+        return predictions
+
+    updated = list(predictions)
+    for i, pred in enumerate(updated):
+        _, removed = _column_diff(*(model_cols or {}).get(pred.model_name, (None, None)))
+        if pred.safety == Safety.SAFE and not removed:
+            continue
+        node_id = model_node_ids.get(pred.model_name)
+        if not node_id:
+            continue
+
+        found: dict[str, object] = {}
+        for owner_nid in (node_id, *all_downstream.get(node_id, [])):
+            for child in child_map.get(owner_nid) or []:
+                exposure = exposure_index.get(child)
+                if exposure is not None:
+                    found[child] = exposure
+        if found:
+            updated[i] = replace(pred, downstream_exposures=[found[k] for k in sorted(found)])
+    return updated
+
+
+def _contract_type_mismatches(node, current_casts: dict[str, str], dialect: str) -> list[str]:
+    """Columns whose explicit cast is a different family from the declared type."""
+    from dbt_plan.columns import type_family
+
+    mismatches = []
+    for column, declared in sorted(getattr(node, "column_types", {}).items()):
+        cast = current_casts.get(column)
+        if not cast:
+            continue  # no explicit cast: the type is the warehouse's answer, not ours
+        want, got = type_family(declared, dialect=dialect), type_family(cast, dialect=dialect)
+        if want and got and want != got:
+            mismatches.append(
+                f"{column} declared {declared}, cast as {cast} -- data type mismatch"
+            )
+    return mismatches
+
+
+def apply_contract(
+    prediction: DDLPrediction,
+    node,
+    current_columns: list[str] | None,
+    current_casts: dict[str, str] | None = None,
+    dialect: str = "snowflake",
+) -> DDLPrediction:
+    """Report a change that an enforced contract will reject.
+
+        A contract is the author stating what the model's shape is, which is exactly
+        the kind of claim dbt-plan can check against the SQL without running anything.
+        dbt checks the same thing at build time and refuses to create the relation:
+
+            This model has an enforced contract that failed.
+            | column_name | definition_type | contract_type | mismatch_reason       |
+            | customer_id |                 | VARCHAR       | missing in definition |
+
+        Under an enforced contract the ordinary safety rules invert. Everywhere else
+        an added column is safe and a `table` is `CREATE OR REPLACE`; here both are a
+        build failure, because dbt requires every column to be declared:
+
+            | note        | VARCHAR         |               | missing in contract |
+
+    Types are compared too, but only by family:
+
+            | customer_id | INTEGER         | VARCHAR       | data type mismatch |
+
+        dbt compares its declared `data_type` against what the warehouse reports, and
+        dbt-plan sees only what the SQL casts explicitly. Deciding that `varchar` and
+        `TEXT` are different would need a per-adapter type table -- measured, a contract
+        declaring `varchar` accepts a `TEXT` cast and rejects an `INTEGER` one -- so the
+        comparison is text against number against date/time against boolean, which is
+        the line no adapter disagrees with. A widening inside a family (`int` to
+        `bigint`) is deliberately not reported; a column with no explicit cast says
+        nothing about its type and is not reported either.
+
+        Never destructive: nothing is dropped, the run stops. Same class as
+        `incremental` + `on_schema_change: fail`.
+    """
+    if not getattr(node, "contract_enforced", False):
+        return prediction
+    if prediction.materialization == "ephemeral":
+        return prediction  # no relation exists, so there is nothing to enforce against
+    declared = {col.lower() for col in node.columns}
+    if not declared:
+        # Enforcement with nothing declared is dbt's error to report, not this one's.
+        return prediction
+
+    unreadable = (
+        current_columns is None
+        or current_columns == ["*"]
+        or (len(current_columns) == 1 and current_columns[0].startswith("* except("))
+    )
+    if unreadable:
+        return replace(
+            prediction,
+            safety=worst_safety([prediction.safety, Safety.WARNING]),
+            operations=[
+                DDLOperation(
+                    "REVIEW REQUIRED (contract enforced, but the columns this SQL "
+                    "produces could not be read)"
+                ),
+                *prediction.operations,
+            ],
+        )
+
+    produced = {col.lower() for col in current_columns}
+    violations = [
+        *(f"{col} missing in definition" for col in sorted(declared - produced)),
+        *(f"{col} missing in contract" for col in sorted(produced - declared)),
+        *_contract_type_mismatches(node, current_casts or {}, dialect),
+    ]
+    if not violations:
+        return prediction
+
+    return replace(
+        prediction,
+        safety=worst_safety([prediction.safety, Safety.WARNING]),
+        operations=[
+            *(DDLOperation(f"CONTRACT VIOLATION: {v}") for v in violations),
+            *prediction.operations,
+        ],
+    )

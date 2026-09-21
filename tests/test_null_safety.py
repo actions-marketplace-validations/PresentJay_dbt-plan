@@ -367,7 +367,7 @@ class TestPredictorNullSafety:
     """Verify predict_ddl handles None on_schema_change gracefully."""
 
     def test_predict_ddl_null_osc(self):
-        """None on_schema_change defaults to 'ignore' behavior."""
+        """Ignoring schema DDL does not guarantee a successful incremental build."""
         from dbt_plan.predictor import Safety, predict_ddl
 
         result = predict_ddl(
@@ -378,8 +378,7 @@ class TestPredictorNullSafety:
             current_columns=["id", "name", "email"],
             status="modified",
         )
-        # None osc → "ignore" → no DDL → SAFE
-        assert result.safety == Safety.SAFE
+        assert result.safety == Safety.WARNING
 
     def test_predict_ddl_null_materialization_treated_as_table(self):
         """If somehow a null materialization leaks through, test it doesn't crash."""
@@ -501,7 +500,10 @@ class TestJsonRoundTripNullValues:
         # null_mat: materialized null -> "table", osc preserved as "fail"
         assert "null_mat" in index
         assert index["null_mat"].materialization == "table"
-        assert index["null_mat"].on_schema_change == "fail"
+        # No `unrendered_config` in this hand-written manifest, and a resolved
+        # on_schema_change cannot say who set it -- so it is kept for incremental,
+        # whose default is dbt's own documented rule, and refused for the rest.
+        assert index["null_mat"].on_schema_change is None
 
         # null_cols: columns null -> empty tuple
         assert "null_cols" in index

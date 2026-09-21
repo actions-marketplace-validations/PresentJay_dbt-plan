@@ -18,9 +18,12 @@ BRANCH="main"
 CHECK_ONLY=false
 [[ "${1:-}" == "--check" ]] && CHECK_ONLY=true
 
-# Every job in ci.yml. A name here that does not exist as a job blocks all
-# merges permanently, so keep this list in step with .github/workflows/ci.yml.
-REQUIRED_CHECKS='["lint","minimum-deps","test (3.10)","test (3.11)","test (3.12)","test (3.13)","test (3.14)"]'
+# Every job in ci.yml, including optional-dependency integrations, built package
+# validation, and every supported Windows/Python combination. These are all
+# required: passing the dependency-light Linux matrix alone is not enough.
+# tests/test_repo_settings.py checks the expanded job names against this list;
+# a required name with no matching job would block every merge.
+REQUIRED_CHECKS='["lint","minimum-deps","test (3.10)","test (3.11)","test (3.12)","test (3.13)","test (3.14)","integrations","packaging","test-windows (3.10)","test-windows (3.11)","test-windows (3.12)","test-windows (3.13)","test-windows (3.14)"]'
 
 # Third-party actions are allowed by explicit pattern only. release.yml is the
 # only workflow holding PYPI_API_TOKEN, so anything running beside it is a
@@ -88,13 +91,20 @@ echo
 echo "Discoverability"
 # Topics and description are the only search surface GitHub gives a repository,
 # and like everything else here they live in the API -- recreating the repo in
-# 2026-08 lost them once already. Topics are exact-match search terms, so both
-# "ci" and "ci-cd" earn their place.
+# 2026-08 lost them once already.
+#
+# The description is written in the words somebody with this problem would type,
+# not the words the tool uses for itself. "Preview the DDL changes dbt run will
+# execute" describes the mechanism; nobody searches for that. They search for a
+# breaking change, a dropped column, a data contract.
 apply "description and homepage" PATCH "repos/$REPO" \
-  '{"description":"Preview the DDL changes dbt run will execute — like terraform plan for dbt. Any warehouse, from compiled SQL.","homepage":"https://presentjay.github.io/dbt-plan"}'
+  '{"description":"Catch breaking dbt schema changes before dbt run executes them: dropped columns, the downstream models and data tests they break, contract violations. Static analysis of compiled SQL, no warehouse connection. Like terraform plan, for dbt.","homepage":"https://presentjay.github.io/dbt-plan"}'
 
+# Topics are exact-match search terms, capped at 20, so each one has to be a term
+# a person would actually filter by. "sql" was dropped for that reason -- hundreds
+# of thousands of repositories carry it and this one will never rank among them.
 apply "topics" PUT "repos/$REPO/topics" \
-  '{"names":["dbt","dbt-core","analytics-engineering","data-engineering","data-quality","static-analysis","sqlglot","ci","ci-cd","github-actions","developer-tools","schema-migration","sql","snowflake","bigquery","redshift","postgres"]}'
+  '{"names":["dbt","dbt-core","breaking-changes","data-contracts","analytics-engineering","data-engineering","data-quality","static-analysis","sqlglot","ci","ci-cd","github-actions","developer-tools","schema-migration","snowflake","bigquery","databricks","duckdb","redshift","postgres"]}'
 
 echo
 echo "Current state"

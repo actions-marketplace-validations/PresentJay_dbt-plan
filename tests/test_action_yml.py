@@ -21,7 +21,7 @@ from dbt_plan.formatter import CheckResult
 from dbt_plan.predictor import DDLOperation, DDLPrediction, Safety
 
 ACTION = Path(__file__).parent.parent / "action.yml"
-ACTION_TEXT = ACTION.read_text()
+ACTION_TEXT = ACTION.read_text(encoding="utf-8")
 
 # `dbt-plan <args>` inside the action's run: blocks, stopping at any redirect or pipe.
 _INVOCATION = re.compile(r"^\s*dbt-plan\s+(?P<args>.+?)\s*(?:[|>]|$)", re.M)
@@ -91,17 +91,24 @@ class TestInvocations:
     def test_the_action_actually_invokes_dbt_plan(self):
         assert len(_INVOCATION.findall(ACTION_TEXT)) >= 3
 
+    def test_target_dir_is_forwarded_to_every_dbt_plan_call(self):
+        assert "target-dir:" in ACTION_TEXT
+        assert ACTION_TEXT.count('dbt-plan snapshot --target-dir "$TARGET_DIR"') == 1
+        assert ACTION_TEXT.count('dbt-plan check --target-dir "$TARGET_DIR"') == 3
+
     def test_every_invocation_survives_argument_parsing(self, tmp_path):
         for raw in _INVOCATION.findall(ACTION_TEXT):
             # Shell variables stand in for caller-supplied values.
             args = [
                 {"$DIALECT": "snowflake"}.get(tok, "x" if tok.startswith("$") else tok)
                 for tok in shlex.split(raw)
+                if tok != "$@"
             ]
             proc = subprocess.run(
                 [sys.executable, "-m", "dbt_plan.cli", *args],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 cwd=tmp_path,
             )
             stderr = proc.stderr.lower()
@@ -123,3 +130,105 @@ class TestSecrets:
     def test_metadata_is_present_for_the_marketplace(self):
         for key in ("name:", "description:", "branding:", "icon:", "color:"):
             assert key in ACTION_TEXT
+
+
+@pytest.mark.parametrize(
+    "code,report,expected",
+    [(code, '{"summary": {}, "models": []}', 0 if code < 3 else 3) for code in range(4)]
+    + [(code, report, 3) for code in (0, 1, 2) for report in ("", "not JSON", "{}")],
+)
+def test_check_step_handles_verdicts_under_github_errexit(tmp_path, code, report, expected):
+    """Execute the actual check shell block with GitHub's bash -e semantics."""
+    import os
+    import shutil
+    import textwrap
+
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash is required to execute the composite Action shell")
+    check = ACTION_TEXT.split("    - name: Check\n", 1)[1].split("    - name: Gate", 1)[0]
+    script = textwrap.dedent(check.split("      run: |\n", 1)[1])
+    output = tmp_path / "outputs"
+    env = {
+        **os.environ,
+        "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", ""),
+        "RUNNER_TEMP": tmp_path.as_posix(),
+        "TARGET_DIR": "target",
+        "DIALECT": "snowflake",
+        "SUMMARY": "false",
+        "GITHUB_OUTPUT": output.as_posix(),
+    }
+    stub = f"dbt-plan() {{ printf '%s\\n' {shlex.quote(report)}; return {code}; }}\n"
+    proc = subprocess.run(
+        [bash, "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", stub + script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if expected == 3:
+        assert proc.returncode == 3
+        assert "::error::" in proc.stdout
+        assert not output.exists()
+    else:
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert f"exit-code={code}" in output.read_text()
+        assert (
+            f"verdict={ {0: 'safe', 1: 'destructive', 2: 'warning'}[code] }" in output.read_text()
+        )
+
+
+@pytest.mark.parametrize("dialect", ["", "postgres", "snowflake", "invalid dialect; exit 0"])
+def test_dialect_is_optional_and_identical_in_every_report(tmp_path, dialect):
+    import json
+    import os
+    import shutil
+    import textwrap
+
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash is required to execute the composite Action shell")
+    check = ACTION_TEXT.split("    - name: Check\n", 1)[1].split("    - name: Gate", 1)[0]
+    script = textwrap.dedent(check.split("      run: |\n", 1)[1])
+    recorder = tmp_path / "record.py"
+    recorder.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['ARGV_LOG'], 'a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "print(json.dumps({'summary': {}, 'models': []}))\n"
+    )
+    env = {
+        **os.environ,
+        "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", ""),
+        "RUNNER_TEMP": tmp_path.as_posix(),
+        "TARGET_DIR": "custom target",
+        "DIALECT": dialect,
+        "SUMMARY": "true",
+        "GITHUB_OUTPUT": (tmp_path / "outputs").as_posix(),
+        "GITHUB_STEP_SUMMARY": (tmp_path / "summary").as_posix(),
+        "ARGV_LOG": str(tmp_path / "args.jsonl"),
+    }
+    prefix = f'dbt-plan() {{ python {shlex.quote(recorder.as_posix())} "$@"; }}\n'
+    result = subprocess.run(
+        [bash, "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", prefix + script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = [json.loads(line) for line in (tmp_path / "args.jsonl").read_text().splitlines()]
+    assert len(calls) == 3
+    for args in calls:
+        assert args[args.index("--target-dir") + 1] == "custom target"
+        if dialect:
+            assert args[args.index("--dialect") + 1] == dialect
+        else:
+            assert "--dialect" not in args
+    assert calls[0][-2:] == ["--format", "json"]
+    assert calls[1][-2:] == ["--format", "github"]
+    assert calls[2][-1] == "--no-color"
+
+
+def test_action_dialect_default_does_not_override_manifest():
+    dialect = ACTION_TEXT.split("  dialect:\n", 1)[1].split("  version:", 1)[0]
+    assert "default: ''" in dialect

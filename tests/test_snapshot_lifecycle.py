@@ -154,7 +154,7 @@ class TestSnapshotOverwrite:
         _do_snapshot(_snapshot_args(project_dir))
 
         base_dir = project_dir / ".dbt-plan" / "base"
-        assert (base_dir / "compiled" / "model_a.sql").exists()
+        assert (base_dir / "compiled" / "models" / "model_a.sql").exists()
 
         # Now change target to only have model_b
         # Remove old compiled files and recreate
@@ -168,8 +168,8 @@ class TestSnapshotOverwrite:
         _do_snapshot(_snapshot_args(project_dir))
 
         # model_a should be gone, model_b should exist
-        assert not (base_dir / "compiled" / "model_a.sql").exists()
-        assert (base_dir / "compiled" / "model_b.sql").exists()
+        assert not (base_dir / "compiled" / "models" / "model_a.sql").exists()
+        assert (base_dir / "compiled" / "models" / "model_b.sql").exists()
 
     def test_manifest_replaced(self, tmp_path, capsys):
         project_dir = tmp_path / "project"
@@ -180,7 +180,7 @@ class TestSnapshotOverwrite:
         _do_snapshot(_snapshot_args(project_dir))
 
         base_dir = project_dir / ".dbt-plan" / "base"
-        m1 = json.loads((base_dir / "manifest.json").read_text())
+        m1 = json.loads((base_dir / "manifest.json").read_text(encoding="utf-8"))
         assert "model.my_project.old_model" in m1["nodes"]
 
         # Second snapshot with different manifest
@@ -191,7 +191,7 @@ class TestSnapshotOverwrite:
         _setup_target(project_dir, {"new_model": "SELECT 2"}, manifest2)
         _do_snapshot(_snapshot_args(project_dir))
 
-        m2 = json.loads((base_dir / "manifest.json").read_text())
+        m2 = json.loads((base_dir / "manifest.json").read_text(encoding="utf-8"))
         assert "model.my_project.old_model" not in m2["nodes"]
         assert "model.my_project.new_model" in m2["nodes"]
 
@@ -216,7 +216,8 @@ class TestEmptyCompiledDir:
         _do_snapshot(_snapshot_args(project_dir))
 
         captured = capsys.readouterr()
-        assert "Snapshot saved" in captured.out
+        assert "Snapshot saved" in captured.err
+        assert "Snapshot saved" not in captured.out
 
         # Verify the snapshot dir was created
         base_compiled = project_dir / ".dbt-plan" / "base" / "compiled"
@@ -333,10 +334,12 @@ class TestManifestMissingDuringSnapshot:
         assert "manifest.json" in captured.err
 
         # But the compiled SQL should still be saved
-        assert "Snapshot saved" in captured.out
+        assert "Snapshot saved" in captured.err
         base_compiled = project_dir / ".dbt-plan" / "base" / "compiled"
-        assert (base_compiled / "my_model.sql").exists()
-        assert (base_compiled / "my_model.sql").read_text() == "SELECT 1"
+        assert (base_compiled / "models" / "my_model.sql").exists()
+        assert (base_compiled / "models" / "my_model.sql").read_text(
+            encoding="utf-8"
+        ) == "SELECT 1"
 
         # And manifest.json should NOT exist in base
         assert not (project_dir / ".dbt-plan" / "base" / "manifest.json").exists()

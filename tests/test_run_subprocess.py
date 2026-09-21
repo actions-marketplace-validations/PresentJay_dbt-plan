@@ -120,22 +120,22 @@ class TestEmptyCompileCommandHandled:
     """
 
     @patch("dbt_plan.config.Config.load")
-    def test_empty_compile_command_returns_2(self, mock_config_load):
-        """Empty compile_command returns exit code 2 with helpful message."""
+    def test_empty_compile_command_returns_3(self, mock_config_load):
+        """Empty compile_command returns exit code 3 with helpful message."""
         mock_config_load.return_value = _mock_config("")
         args = _make_run_args("/tmp/fake", compile_command="")
 
         exit_code = _do_run(args)
-        assert exit_code == 2
+        assert exit_code == 3
 
     @patch("dbt_plan.config.Config.load")
-    def test_whitespace_compile_command_returns_2(self, mock_config_load):
-        """Whitespace-only compile_command returns exit code 2 with helpful message."""
+    def test_whitespace_compile_command_returns_3(self, mock_config_load):
+        """Whitespace-only compile_command returns exit code 3 with helpful message."""
         mock_config_load.return_value = _mock_config("   ")
         args = _make_run_args("/tmp/fake", compile_command="   ")
 
         exit_code = _do_run(args)
-        assert exit_code == 2
+        assert exit_code == 3
 
     @patch("dbt_plan.config.Config.load")
     def test_empty_compile_command_error_message(self, mock_config_load, capsys):
@@ -175,7 +175,7 @@ class TestVersionCheckLogic:
         mock_run.return_value = version_result
 
         exit_code = _do_run(args)
-        assert exit_code == 2
+        assert exit_code == 3
 
         # Verify it tried the --version check
         mock_run.assert_called_once_with(["mycli", "--version"], capture_output=True)
@@ -190,7 +190,7 @@ class TestVersionCheckLogic:
         mock_run.side_effect = FileNotFoundError("No such file")
 
         exit_code = _do_run(args)
-        assert exit_code == 2
+        assert exit_code == 3
 
     @patch("subprocess.run")
     @patch("dbt_plan.config.Config.load")
@@ -220,7 +220,7 @@ class TestVersionCheckLogic:
 
         exit_code = _do_run(args)
         # Should fail at git status step, not at version check
-        assert exit_code == 2
+        assert exit_code == 3
         assert call_count == 2
 
 
@@ -270,14 +270,17 @@ class TestGitStashSafety:
                 # Baseline compile fails
                 result.returncode = 1
                 result.stderr = "dbt compile failed"
-            elif cmd == ["git", "stash", "pop"]:
+            elif cmd == ["git", "stash", "pop", "--index"]:
                 result.returncode = 0
+            if cmd == ["git", "rev-parse", "stash@{0}"]:
+                pushed = any(c[:3] == ["git", "stash", "push"] for c in call_sequence)
+                result.stdout = "a" * 40 if pushed else ""
             return result
 
         mock_run.side_effect = side_effect
 
         exit_code = _do_run(args)
-        assert exit_code == 2
+        assert exit_code == 3
 
         # Verify stash pop was called after compile failure
         stash_push_seen = False
@@ -285,7 +288,7 @@ class TestGitStashSafety:
         for cmd in call_sequence:
             if isinstance(cmd, list) and "push" in cmd and "stash" in cmd:
                 stash_push_seen = True
-            if cmd == ["git", "stash", "pop"]:
+            if cmd == ["git", "stash", "pop", "--index"]:
                 stash_pop_seen = True
 
         assert stash_push_seen, "stash push should have been called"
@@ -365,7 +368,7 @@ class TestGitStashSafety:
         # The function does NOT check stash push return code, so it continues
         exit_code = _do_run(args)
         # It proceeds to compile, which fails, then tries stash pop
-        assert exit_code == 2
+        assert exit_code == 3
 
 
 # ===========================================================================
@@ -403,7 +406,7 @@ class TestCompileFailureHandling:
         mock_run.side_effect = side_effect
 
         exit_code = _do_run(args)
-        assert exit_code == 2
+        assert exit_code == 3
 
         captured = capsys.readouterr()
         assert "Database connection timeout after 30s" in captured.err
@@ -446,7 +449,7 @@ class TestCompileFailureHandling:
         mock_run.side_effect = side_effect
 
         exit_code = _do_run(args)
-        assert exit_code == 2
+        assert exit_code == 3
 
         captured = capsys.readouterr()
         assert "Syntax error in model_x.sql line 42" in captured.err
@@ -517,12 +520,17 @@ class TestShellInjectionSafety:
         compile_result.returncode = 1
         compile_result.stderr = "unknown arg: |"
 
-        mock_run.side_effect = [version_result, git_status, compile_result]
+        # `run` reads the short HEAD between status and compile, to say which
+        # baseline it is using -- see the default branch of `--against`.
+        head = MagicMock()
+        head.returncode = 0
+        head.stdout = "a1b2c3d\n"
+        mock_run.side_effect = [version_result, git_status, head, compile_result]
 
         _do_run(args)
 
         # Verify the compile call passed pipe as literal arg (list form, no shell)
-        compile_call = mock_run.call_args_list[2]
+        compile_call = mock_run.call_args_list[3]
         assert compile_call[0][0] == ["dbt", "compile", "|", "tee", "log.txt"]
 
     @patch("subprocess.run")
@@ -541,11 +549,14 @@ class TestShellInjectionSafety:
         compile_result.returncode = 1
         compile_result.stderr = "unknown arg: >"
 
-        mock_run.side_effect = [version_result, git_status, compile_result]
+        head = MagicMock()
+        head.returncode = 0
+        head.stdout = "a1b2c3d\n"
+        mock_run.side_effect = [version_result, git_status, head, compile_result]
 
         _do_run(args)
 
-        compile_call = mock_run.call_args_list[2]
+        compile_call = mock_run.call_args_list[3]
         assert compile_call[0][0] == ["dbt", "compile", ">", "/dev/null"]
 
     @patch("subprocess.run")
@@ -564,11 +575,14 @@ class TestShellInjectionSafety:
         compile_result.returncode = 1
         compile_result.stderr = "unknown arg"
 
-        mock_run.side_effect = [version_result, git_status, compile_result]
+        head = MagicMock()
+        head.returncode = 0
+        head.stdout = "a1b2c3d\n"
+        mock_run.side_effect = [version_result, git_status, head, compile_result]
 
         _do_run(args)
 
-        compile_call = mock_run.call_args_list[2]
+        compile_call = mock_run.call_args_list[3]
         # The dangerous command is NOT executed — it's just a literal arg to dbt
         assert compile_call[0][0] == ["dbt", "compile", ";", "rm", "-rf", "/"]
 
@@ -594,11 +608,14 @@ class TestShellInjectionSafety:
         compile_result.returncode = 1
         compile_result.stderr = "error"
 
-        mock_run.side_effect = [version_result, git_status, compile_result]
+        head = MagicMock()
+        head.returncode = 0
+        head.stdout = "a1b2c3d\n"
+        mock_run.side_effect = [version_result, git_status, head, compile_result]
 
         _do_run(args)
 
-        compile_call = mock_run.call_args_list[2]
+        compile_call = mock_run.call_args_list[3]
         # shlex splits $(cat /etc/passwd) into two tokens, but neither is executed
         assert compile_call[0][0] == ["dbt", "compile", "$(cat", "/etc/passwd)"]
 
@@ -613,8 +630,8 @@ class TestGitNotFound:
 
     @patch("subprocess.run")
     @patch("dbt_plan.config.Config.load")
-    def test_git_not_found_returns_2(self, mock_config_load, mock_run, tmp_path):
-        """If git binary is missing, return exit code 2 with helpful message."""
+    def test_git_not_found_returns_3(self, mock_config_load, mock_run, tmp_path):
+        """If git binary is missing, return exit code 3 with helpful message."""
         mock_config_load.return_value = _mock_config("dbt compile")
         args = _make_run_args(str(tmp_path), compile_command="dbt compile")
 
@@ -634,12 +651,12 @@ class TestGitNotFound:
         mock_run.side_effect = side_effect
 
         exit_code = _do_run(args)
-        assert exit_code == 2
+        assert exit_code == 3
 
     @patch("subprocess.run")
     @patch("dbt_plan.config.Config.load")
-    def test_not_a_git_repo_returns_2(self, mock_config_load, mock_run, tmp_path):
-        """If not in a git repo, git status returns non-zero -> exit code 2."""
+    def test_not_a_git_repo_returns_3(self, mock_config_load, mock_run, tmp_path):
+        """If not in a git repo, git status returns non-zero -> exit code 3."""
         mock_config_load.return_value = _mock_config("dbt compile")
         args = _make_run_args(str(tmp_path), compile_command="dbt compile")
 
@@ -658,7 +675,7 @@ class TestGitNotFound:
         mock_run.side_effect = side_effect
 
         exit_code = _do_run(args)
-        assert exit_code == 2
+        assert exit_code == 3
 
 
 # ===========================================================================
@@ -667,7 +684,24 @@ class TestGitNotFound:
 
 
 class TestFullRunStructure:
-    """Verify the full _do_run call sequence with mocked subprocess."""
+    """Verify the full _do_run call sequence with mocked subprocess.
+
+    Asserted as an *order*, not as positions. These tests used to index into the
+    list, so adding one git call to `run` broke five of them at once while every
+    property they were defending still held.
+    """
+
+    @staticmethod
+    def _order(call_sequence, *commands):
+        """Assert `commands` appear in the sequence, in this order, ignoring the rest."""
+        remaining = list(call_sequence)
+        for command in commands:
+            match = next(
+                (i for i, cmd in enumerate(remaining) if isinstance(cmd, list) and cmd == command),
+                None,
+            )
+            assert match is not None, f"{command} not called after the ones before it"
+            remaining = remaining[match + 1 :]
 
     @patch("dbt_plan.cli._do_check")
     @patch("dbt_plan.cli._do_snapshot")
@@ -676,7 +710,7 @@ class TestFullRunStructure:
     def test_happy_path_with_changes(
         self, mock_config_load, mock_run, mock_snapshot, mock_check, tmp_path
     ):
-        """Full run with uncommitted changes: version -> status -> stash -> compile -> snapshot -> pop -> compile -> check."""
+        """version -> status -> stash -> compile -> snapshot -> pop -> compile -> check."""
         mock_config_load.return_value = _mock_config("dbt compile")
         mock_check.return_value = 0
         args = _make_run_args(str(tmp_path), compile_command="dbt compile")
@@ -692,6 +726,9 @@ class TestFullRunStructure:
 
             if cmd == ["git", "status", "--porcelain"]:
                 result.stdout = "M models/test.sql\n"
+            if cmd == ["git", "rev-parse", "stash@{0}"]:
+                pushed = any(c[:3] == ["git", "stash", "push"] for c in call_sequence)
+                result.stdout = "a" * 40 if pushed else ""
             return result
 
         mock_run.side_effect = side_effect
@@ -699,28 +736,22 @@ class TestFullRunStructure:
         exit_code = _do_run(args)
         assert exit_code == 0
 
-        # Verify the expected call sequence
-        assert call_sequence[0] == ["dbt", "--version"]
-        assert call_sequence[1] == ["git", "status", "--porcelain"]
+        push = next(c for c in call_sequence if isinstance(c, list) and c[0:2] == ["git", "stash"])
+        assert "push" in push
 
-        # stash push
-        assert call_sequence[2][0:2] == ["git", "stash"]
-        assert "push" in call_sequence[2]
+        self._order(
+            call_sequence,
+            ["dbt", "--version"],
+            ["git", "status", "--porcelain"],
+            push,
+            # The exact stash entry is recorded so the restore cannot pop another.
+            ["git", "rev-parse", "stash@{0}"],
+            ["dbt", "compile"],  # baseline
+            ["git", "rev-parse", "stash@{0}"],  # identity re-checked before popping
+            ["git", "stash", "pop", "--index"],
+            ["dbt", "compile"],  # current
+        )
 
-        # baseline compile
-        # the exact stash entry is recorded so the restore cannot pop another
-        assert call_sequence[3] == ["git", "rev-parse", "stash@{0}"]
-
-        assert call_sequence[4] == ["dbt", "compile"]
-
-        # identity re-checked, then popped (after snapshot)
-        assert call_sequence[5] == ["git", "rev-parse", "stash@{0}"]
-        assert call_sequence[6] == ["git", "stash", "pop"]
-
-        # current compile
-        assert call_sequence[7] == ["dbt", "compile"]
-
-        # snapshot and check were called
         mock_snapshot.assert_called_once()
         mock_check.assert_called_once()
 
@@ -751,16 +782,17 @@ class TestFullRunStructure:
         exit_code = _do_run(args)
         assert exit_code == 1
 
-        # No stash commands
-        stash_cmds = [c for c in call_sequence if isinstance(c, list) and "stash" in c]
-        assert stash_cmds == []
+        # Nothing was stashed, so nothing may be popped -- popping without pushing
+        # would restore an entry the user made themselves.
+        assert [c for c in call_sequence if isinstance(c, list) and "stash" in c] == []
 
-        # Only: version, status, compile (baseline), compile (current)
-        assert len(call_sequence) == 4
-        assert call_sequence[0] == ["dbt", "--version"]
-        assert call_sequence[1] == ["git", "status", "--porcelain"]
-        assert call_sequence[2] == ["dbt", "compile"]
-        assert call_sequence[3] == ["dbt", "compile"]
+        self._order(
+            call_sequence,
+            ["dbt", "--version"],
+            ["git", "status", "--porcelain"],
+            ["dbt", "compile"],  # baseline
+            ["dbt", "compile"],  # current
+        )
 
 
 # ===========================================================================
@@ -806,7 +838,7 @@ class TestStashPushFailureHalts:
         mock_run.side_effect = side_effect
 
         exit_code = _do_run(args)
-        assert exit_code == 2
+        assert exit_code == 3
 
         compile_cmds = [c for c in call_sequence if c == ["dbt", "compile"]]
         assert compile_cmds == [], "must not compile a baseline from a dirty tree"

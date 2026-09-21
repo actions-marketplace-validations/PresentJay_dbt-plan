@@ -1,6 +1,8 @@
 """Tests for configuration loading from .dbt-plan.yml and env vars."""
 
-from dbt_plan.config import Config
+import pytest
+
+from dbt_plan.config import Config, ConfigError
 
 
 class TestConfigDefaults:
@@ -40,6 +42,44 @@ class TestConfigFile:
         config = Config.load(tmp_path)
         assert config.dialect == "bigquery"
 
+    def test_load_quoted_scalar(self, tmp_path):
+        (tmp_path / ".dbt-plan.yml").write_text('dialect: "bigquery"\n')
+        assert Config.load(tmp_path).dialect == "bigquery"
+
+    def test_load_trailing_comment(self, tmp_path):
+        (tmp_path / ".dbt-plan.yml").write_text("dialect: bigquery  # warehouse\n")
+        assert Config.load(tmp_path).dialect == "bigquery"
+
+    def test_hash_inside_quoted_scalar_is_not_a_comment(self, tmp_path):
+        (tmp_path / ".dbt-plan.yml").write_text('compile_command: "dbt # compile"\n')
+        assert Config.load(tmp_path).compile_command == "dbt # compile"
+
+    def test_load_block_lists(self, tmp_path):
+        (tmp_path / ".dbt-plan.yml").write_text(
+            "ignore_models:\n"
+            "  - staging_a\n"
+            "  - 'staging_b' # comment\n"
+            "acknowledge_models:\n"
+            '  - "accepted_model"\n'
+        )
+        config = Config.load(tmp_path)
+        assert config.ignore_models == ["staging_a", "staging_b"]
+        assert config.acknowledge_models == ["accepted_model"]
+
+    def test_malformed_setting_warns_with_line_number(self, tmp_path, capsys):
+        (tmp_path / ".dbt-plan.yml").write_text("format: xml\n")
+        config = Config.load(tmp_path)
+        assert config.format == "text"
+        warning = capsys.readouterr().err
+        assert ":1: warning: cannot understand format" in warning
+
+    def test_unknown_key_warns_with_line_number_and_keeps_parsing(self, tmp_path, capsys):
+        (tmp_path / ".dbt-plan.yml").write_text("dialects: bigquery\nformat: json\n")
+        config = Config.load(tmp_path)
+        assert config.dialect == "snowflake"
+        assert config.format == "json"
+        assert ":1: warning: cannot understand dialects" in capsys.readouterr().err
+
     def test_ignores_comments_and_blanks(self, tmp_path):
         """Comments and blank lines are skipped."""
         (tmp_path / ".dbt-plan.yml").write_text(
@@ -59,6 +99,21 @@ class TestConfigFile:
         (tmp_path / ".dbt-plan.yml").write_text("dialect: ; rm -rf /\n")
         config = Config.load(tmp_path)
         assert config.dialect == "snowflake"  # stays default
+
+    def test_malicious_dialect_does_not_suppress_manifest_inference(self, tmp_path, capsys):
+        """A rejected dialect value must not block manifest adapter inference."""
+        (tmp_path / ".dbt-plan.yml").write_text("dialect: ; rm -rf /\n")
+        config = Config.load(tmp_path)
+        assert config.dialect_explicit is False
+        assert config.resolve_dialect("bigquery") == "bigquery"
+        assert ":1: warning: cannot understand dialect" in capsys.readouterr().err
+
+    def test_file_dialect_sets_explicit(self, tmp_path):
+        """A valid dialect value is treated as an explicit human choice."""
+        (tmp_path / ".dbt-plan.yml").write_text("dialect: bigquery\n")
+        config = Config.load(tmp_path)
+        assert config.dialect_explicit is True
+        assert config.resolve_dialect("duckdb") == "bigquery"
 
     def test_missing_file_uses_defaults(self, tmp_path):
         """No config file → all defaults."""
@@ -141,12 +196,6 @@ class TestEnvVars:
         config = Config.load(tmp_path)
         assert config.warning_exit_code == 2  # default
 
-    def test_env_include_packages(self, tmp_path, monkeypatch):
-        """DBT_PLAN_INCLUDE_PACKAGES enables package model checking."""
-        monkeypatch.setenv("DBT_PLAN_INCLUDE_PACKAGES", "true")
-        config = Config.load(tmp_path)
-        assert config.include_packages is True
-
     def test_env_compile_command(self, tmp_path, monkeypatch):
         """DBT_PLAN_COMPILE_COMMAND overrides compile command."""
         monkeypatch.setenv("DBT_PLAN_COMPILE_COMMAND", "uv run dbt compile")
@@ -158,12 +207,6 @@ class TestEnvVars:
         (tmp_path / ".dbt-plan.yml").write_text("no_color: true\n")
         config = Config.load(tmp_path)
         assert config.no_color is True
-
-    def test_file_include_packages(self, tmp_path):
-        """include_packages setting from config file."""
-        (tmp_path / ".dbt-plan.yml").write_text("include_packages: true\n")
-        config = Config.load(tmp_path)
-        assert config.include_packages is True
 
     def test_file_compile_command(self, tmp_path):
         """compile_command setting from config file."""
@@ -177,18 +220,19 @@ class TestEnvVars:
         config = Config.load(tmp_path)
         assert config.warning_exit_code == 2  # default
 
-    def test_line_without_colon_ignored(self, tmp_path):
-        """Config lines without colon separator are silently ignored."""
+    def test_line_without_colon_warns(self, tmp_path, capsys):
+        """Config lines without colon separator warn and do not stop parsing."""
         (tmp_path / ".dbt-plan.yml").write_text("this line has no separator\nformat: json\n")
         config = Config.load(tmp_path)
         assert config.format == "json"
+        assert ":1: warning: cannot understand setting" in capsys.readouterr().err
 
     def test_unreadable_config_file(self, tmp_path):
-        """Config file that can't be read uses defaults."""
+        """Unreadable config cannot silently replace the user's policy."""
         config_path = tmp_path / ".dbt-plan.yml"
         config_path.mkdir()  # directory, not a file → OSError on read
-        config = Config.load(tmp_path)
-        assert config.dialect == "snowflake"  # default
+        with pytest.raises(ConfigError, match="Could not read configuration"):
+            Config.load(tmp_path)
 
     def test_bom_prefixed_config_file(self, tmp_path):
         """BOM at start of config file should not corrupt the first key."""
@@ -196,3 +240,11 @@ class TestEnvVars:
         config = Config.load(tmp_path)
         assert config.dialect == "postgres"
         assert config.format == "json"
+
+
+# `include_packages` used to be settable here, from the file and from
+# DBT_PLAN_INCLUDE_PACKAGES. It never checked package models -- it widened the
+# manifest index while the compiled scan stayed on the root project -- so it was
+# removed in 0.11.0. What replaces those two tests lives in
+# tests/test_include_packages_removed.py: the key is still recognised, warns that
+# it is ignored, and no longer appears on Config at all.

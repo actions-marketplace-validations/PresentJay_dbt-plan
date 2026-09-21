@@ -41,6 +41,54 @@ class TestFormatText:
         assert "no model changes detected" in output
 
 
+class TestBaselineProblem:
+    """A baseline we could not read must show up in every format (#155)."""
+
+    def test_text_warns_instead_of_claiming_no_changes(self):
+        result = CheckResult(baseline_problem="corrupt")
+        output = format_text(result)
+        assert "WARNING" in output
+        assert "manifest" in output.lower()
+        assert "no model changes detected" not in output
+
+    def test_missing_versus_corrupt_say_different_things(self):
+        assert "snapshot" in format_text(CheckResult(baseline_problem="missing")).lower()
+        corrupt = format_text(CheckResult(baseline_problem="corrupt")).lower()
+        assert "revision" in corrupt or "walk" in corrupt
+
+    def test_text_warns_alongside_predictions(self):
+        result = CheckResult(
+            predictions=[
+                DDLPrediction(
+                    model_name="dim_users",
+                    materialization="incremental",
+                    on_schema_change="sync_all_columns",
+                    safety=Safety.SAFE,
+                    operations=[DDLOperation("ADD COLUMN", "age")],
+                    columns_added=["age"],
+                    columns_removed=[],
+                ),
+            ],
+            baseline_problem="missing",
+        )
+        output = format_text(result)
+        assert "dim_users" in output
+        assert "WARNING" in output
+
+    def test_github_warns_without_hiding_the_empty_report(self):
+        output = format_github(CheckResult(baseline_problem="corrupt"))
+        assert "WARNING" in output
+        assert "no model changes detected" not in output
+
+    def test_json_carries_the_problem_key(self):
+        output = format_json(CheckResult(baseline_problem="missing"))
+        assert json.loads(output)["baseline_problem"] == "missing"
+
+    def test_json_omits_the_key_when_the_baseline_is_fine(self):
+        output = format_json(CheckResult(predictions=[], downstream_map={}, parse_failures=[]))
+        assert "baseline_problem" not in json.loads(output)
+
+
 class TestFormatGithub:
     def test_safe_markdown(self):
         """Safe prediction uses markdown formatting."""
@@ -284,6 +332,80 @@ class TestCascadeImpactFormatting:
         assert len(model["downstream_impacts"]) == 1
         assert model["downstream_impacts"][0]["risk"] == "broken_ref"
         assert model["downstream_impacts"][0]["model_name"] == "fct_metrics"
+
+    def test_long_data_test_names_are_shortened_only_in_human_output(self):
+        full_name = (
+            "accepted_values_stg_orders_status__placed__shipped__completed"
+            "__return_pending__returned"
+        )
+        impact = DownstreamImpact(
+            model_name=full_name,
+            materialization="data_test",
+            on_schema_change=None,
+            risk="data_test_failure",
+            reason="tests dropped column(s): status",
+        )
+        result = self._make_cascade_result()
+        result.predictions[0].downstream_impacts[:] = [impact]
+
+        text = format_text(result, color=False)
+        github = format_github(result)
+        data = json.loads(format_json(result))
+
+        assert full_name not in text
+        assert full_name not in github
+        assert "accepted_values_stg_orders_status__...ng__returned" in text
+        assert "accepted_values_stg_orders_status__...ng__returned" in github
+        assert data["models"][0]["downstream_impacts"][0]["model_name"] == full_name
+
+    def test_shortened_data_test_names_keep_distinguishing_columns(self):
+        impacts = [
+            DownstreamImpact(
+                model_name=(
+                    f"accepted_values_stg_orders_{column}__placed__shipped__completed"
+                    "__return_pending__returned"
+                ),
+                materialization="data_test",
+                on_schema_change=None,
+                risk="data_test_failure",
+                reason=f"tests dropped column(s): {column}",
+            )
+            for column in ("status_code", "status_text")
+        ]
+        result = self._make_cascade_result()
+        result.predictions[0].downstream_impacts[:] = impacts
+
+        output = format_text(result, color=False)
+
+        assert "accepted_values_stg_orders_status_c...ng__returned" in output
+        assert "accepted_values_stg_orders_status_t...ng__returned" in output
+
+    def test_colliding_shortened_names_fall_back_to_full_names(self):
+        prefix = "accepted_values_stg_orders_status_"
+        suffix = "__pending__returned"
+        names = [
+            f"{prefix}{middle}{suffix}"
+            for middle in (
+                "placed__shipped__completed__return",
+                "placed__processing__completed__return",
+            )
+        ]
+        impacts = [
+            DownstreamImpact(
+                model_name=name,
+                materialization="data_test",
+                on_schema_change=None,
+                risk="data_test_failure",
+                reason="tests dropped column(s): status",
+            )
+            for name in names
+        ]
+        result = self._make_cascade_result()
+        result.predictions[0].downstream_impacts[:] = impacts
+
+        output = format_text(result, color=False)
+
+        assert all(name in output for name in names)
 
     def test_summary_line_includes_cascade_count(self):
         """Summary line shows cascade risk count when present."""

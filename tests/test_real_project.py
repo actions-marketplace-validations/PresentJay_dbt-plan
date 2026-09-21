@@ -101,8 +101,10 @@ class TestRealManifestLoading:
         stg_children = child_map.get("model.test_project.stg_orders", [])
         assert "model.test_project.dim_books" in stg_children
         assert "model.test_project.fct_orders" in stg_children
-        # Leaf models have no children
-        assert child_map.get("model.test_project.dim_books", []) == []
+        # A leaf model still has its unit tests hanging off it, and nothing else.
+        assert child_map.get("model.test_project.dim_books", []) == [
+            "unit_test.test_project.dim_books.test_dim_books_groups_by_store"
+        ]
         assert child_map.get("model.test_project.fct_orders", []) == []
 
 
@@ -126,18 +128,32 @@ class TestRealNodeIndex:
         assert index["dim_books"].materialization == "table"
         assert index["fct_orders"].materialization == "incremental"
 
-    def test_node_on_schema_change(self, real_manifest):
-        """Node index preserves on_schema_change settings."""
-        index = build_node_index(real_manifest)
-        assert index["fct_orders"].on_schema_change == "sync_all_columns"
-        assert index["stg_orders"].on_schema_change == "ignore"
+    def test_on_schema_change_is_kept_only_where_the_author_set_it(self, real_manifest):
+        """dbt resolves it for every model, so the resolved value asserts nothing.
 
-    def test_node_columns_empty(self, real_manifest):
-        """Real manifest has no column definitions (empty columns dict)."""
+        `stg_orders` is a view and nobody wrote `on_schema_change` for it; dbt still
+        records `"ignore"`. Carrying that as the author's assertion is what let a
+        materialized view drop a column and report NO DDL.
+        """
         index = build_node_index(real_manifest)
-        # The manifest has "columns": {} for all models — no column docs
-        assert index["stg_orders"].columns == ()
+        assert (
+            real_manifest["nodes"]["model.test_project.stg_orders"]["config"]["on_schema_change"]
+            == "ignore"
+        )
+        assert index["stg_orders"].on_schema_change is None
+        assert index["fct_orders"].on_schema_change == "sync_all_columns"
+
+    def test_node_columns_come_from_the_schema_file_or_not_at_all(self, real_manifest):
+        """The fixture has both cases on purpose, so both paths are exercised.
+
+        A column only appears in `node["columns"]` once something in a schema file
+        mentions it -- attaching a test counts. stg_orders has tests, so it has the
+        fallback available; the other two have no schema entry at all.
+        """
+        index = build_node_index(real_manifest)
+        assert index["stg_orders"].columns == ("order_id", "customer_id")
         assert index["fct_orders"].columns == ()
+        assert index["dim_books"].columns == ()
 
     def test_downstream_from_stg_orders(self, real_manifest):
         """stg_orders downstream includes dim_books and fct_orders."""
@@ -164,7 +180,7 @@ class TestRealCompiledSQL:
 
     def test_stg_orders_columns(self):
         """stg_orders compiled SQL has expected columns."""
-        sql = (COMPILED_DIR / "staging" / "stg_orders.sql").read_text()
+        sql = (COMPILED_DIR / "staging" / "stg_orders.sql").read_text(encoding="utf-8")
         # duckdb dialect; try generic parsing
         cols = extract_columns(sql, dialect="duckdb")
         if cols is None:
@@ -184,7 +200,7 @@ class TestRealCompiledSQL:
         may not handle all compiled SQL patterns — if this fallback triggers,
         investigate whether a duckdb-specific SQL pattern regressed.
         """
-        sql = (COMPILED_DIR / "marts" / "fct_orders.sql").read_text()
+        sql = (COMPILED_DIR / "marts" / "fct_orders.sql").read_text(encoding="utf-8")
         cols = extract_columns(sql, dialect="duckdb")
         if cols is None:
             cols = extract_columns(sql, dialect="snowflake")
@@ -196,7 +212,7 @@ class TestRealCompiledSQL:
 
     def test_dim_books_columns(self):
         """dim_books compiled SQL has expected columns."""
-        sql = (COMPILED_DIR / "marts" / "dim_books.sql").read_text()
+        sql = (COMPILED_DIR / "marts" / "dim_books.sql").read_text(encoding="utf-8")
         cols = extract_columns(sql, dialect="duckdb")
         if cols is None:
             cols = extract_columns(sql, dialect="snowflake")
@@ -458,6 +474,14 @@ class TestFullCheckPipeline:
             'FROM "memory"."main"."stg_orders"\n'
             "GROUP BY 1\n"
         )
+
+        # A compiled fixture must agree with the manifest from that invocation.
+        current_manifest_path = project_dir / "target" / "manifest.json"
+        current_manifest = json.loads(current_manifest_path.read_text(encoding="utf-8"))
+        current_manifest["nodes"]["model.test_project.dim_books"]["compiled_code"] = dim.read_text(
+            encoding="utf-8"
+        )
+        current_manifest_path.write_text(json.dumps(current_manifest), encoding="utf-8")
 
         monkeypatch.setattr(
             "sys.argv",

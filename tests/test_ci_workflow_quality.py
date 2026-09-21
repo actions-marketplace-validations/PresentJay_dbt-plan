@@ -11,11 +11,15 @@ from __future__ import annotations
 
 import argparse
 import re
+from pathlib import Path
 
 import pytest
 
 from dbt_plan.cli import _CI_WORKFLOW, _do_ci_setup
+from tests.test_generated_ci_execution import script, step
 
+_REPOSITORY_CI_WORKFLOW = Path(__file__).parents[1] / ".github" / "workflows" / "ci.yml"
+_EXAMPLE_CI_WORKFLOW = Path(__file__).parents[1] / "examples" / "ci-workflow" / "dbt-plan.yml"
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -37,13 +41,13 @@ class TestGeneratedYamlValid:
     def test_ci_setup_creates_file(self, tmp_path):
         """ci-setup generates a .yml file that exists and is non-empty."""
         wf_path = _run_ci_setup(tmp_path)
-        content = wf_path.read_text()
+        content = wf_path.read_text(encoding="utf-8")
         assert len(content) > 0
 
     def test_has_required_top_level_keys(self, tmp_path):
         """Generated workflow has name:, on:, jobs:, and concurrency: at top level."""
         wf_path = _run_ci_setup(tmp_path)
-        content = wf_path.read_text()
+        content = wf_path.read_text(encoding="utf-8")
         # These keys must appear at column 0 (top-level YAML keys)
         assert re.search(r"^name:", content, re.MULTILINE)
         assert re.search(r"^on:", content, re.MULTILINE)
@@ -53,7 +57,7 @@ class TestGeneratedYamlValid:
     def test_name_is_dbt_plan(self, tmp_path):
         """Workflow name is 'dbt-plan'."""
         wf_path = _run_ci_setup(tmp_path)
-        content = wf_path.read_text()
+        content = wf_path.read_text(encoding="utf-8")
         assert re.search(r"^name:\s*dbt-plan\s*$", content, re.MULTILINE)
 
 
@@ -63,13 +67,27 @@ class TestGeneratedYamlValid:
 
 
 class TestWorkflowStructure:
-    def test_pull_request_paths_include_models(self):
-        """on.pull_request.paths includes models/**."""
-        assert "models/**" in _CI_WORKFLOW
+    @pytest.mark.parametrize(
+        "project_config",
+        [
+            "",
+            'model-paths: ["transformations"]\n',
+            "model-paths:\n- transformations\n",
+            "model-paths:\n  - transformations\n",
+            '"model-paths": ["transformations"]\n',
+            "custom: &dirs [transformations]\nmodel-paths: *dirs\n",
+            "model-paths: [\"{{ env_var('MODEL_DIR') }}\"]\n",
+        ],
+    )
+    def test_generated_workflow_cannot_skip_dbt_inputs(self, tmp_path, project_config):
+        (tmp_path / "dbt_project.yml").write_text(project_config, encoding="utf-8")
+        workflow = _run_ci_setup(tmp_path).read_text(encoding="utf-8")
+        assert re.search(r"^  pull_request:\s*\{\}\s*$", workflow, re.MULTILINE)
+        assert not re.search(r"^\s+paths(?:-ignore)?:", workflow, re.MULTILINE)
 
-    def test_pull_request_paths_include_macros(self):
-        """on.pull_request.paths includes macros/**."""
-        assert "macros/**" in _CI_WORKFLOW
+    def test_template_runs_for_every_pull_request(self):
+        assert "  pull_request: {}" in _CI_WORKFLOW
+        assert not re.search(r"^\s+paths(?:-ignore)?:", _CI_WORKFLOW, re.MULTILINE)
 
     def test_concurrency_cancel_in_progress_true(self):
         """concurrency.cancel-in-progress is true."""
@@ -94,6 +112,36 @@ class TestWorkflowStructure:
         assert block, "permissions block not found"
         scopes = dict(re.findall(r"(\S+):\s*(\S+)", block.group(1)))
         assert scopes == {"contents": "read"}, f"expected only contents: read, got {scopes}"
+
+
+class TestExampleWorkflow:
+    def test_example_runs_for_every_pull_request(self):
+        """The example cannot omit inputs that the generated workflow checks."""
+        content = _EXAMPLE_CI_WORKFLOW.read_text(encoding="utf-8")
+        assert "  pull_request: {}" in content
+        assert not re.search(r"^\s+paths(?:-ignore)?:", content, re.MULTILINE)
+
+
+class TestRepositoryCiJobs:
+    """Keep branch-protection job names stable while adding Windows coverage."""
+
+    def test_test_job_keeps_ubuntu_matrix_contexts(self):
+        content = _REPOSITORY_CI_WORKFLOW.read_text(encoding="utf-8")
+        block = re.search(r"^  test:\n(.*?)(?=^  \w|\Z)", content, re.MULTILINE | re.DOTALL)
+        assert block, "test job not found"
+        assert "runs-on: ubuntu-latest" in block.group(1)
+        assert "os:" not in block.group(1)
+        assert 'python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]' in block.group(1)
+
+    def test_windows_coverage_is_separate_and_blocking(self):
+        content = _REPOSITORY_CI_WORKFLOW.read_text(encoding="utf-8")
+        block = re.search(
+            r"^  test-windows:\n(.*?)(?=^  \w|\Z)", content, re.MULTILINE | re.DOTALL
+        )
+        assert block, "test-windows job not found"
+        assert "runs-on: windows-latest" in block.group(1)
+        assert "continue-on-error: true" not in block.group(1)
+        assert 'python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]' in block.group(1)
 
 
 # ---------------------------------------------------------------------------
@@ -121,70 +169,36 @@ class TestStepsComplete:
         install_block = install_match.group(1)
         assert "uv sync" in install_block
 
-    def test_install_step_has_pip_install_dbt_plan(self):
-        """Install step includes 'pip install dbt-plan'."""
-        install_match = re.search(
-            r"- name: Install\s*\n\s*run: \|(.+?)(?=\n\s*- )", _CI_WORKFLOW, re.DOTALL
+    def test_install_step_targets_the_project_environment(self):
+        assert 'uv pip install --python "$UV_PROJECT_ENVIRONMENT/bin/python" dbt-plan' in script(
+            "Install"
         )
-        assert install_match, "Install step not found"
-        install_block = install_match.group(1)
-        assert "pip install dbt-plan" in install_block
 
     def test_snapshot_step_checks_out_base_sha(self):
-        """Snapshot step checks out the base SHA."""
-        snapshot_match = re.search(
-            r"- name: Snapshot base\s*\n\s*run: \|(.+?)(?=\n\s*- )", _CI_WORKFLOW, re.DOTALL
-        )
-        assert snapshot_match, "Snapshot base step not found"
-        snapshot_block = snapshot_match.group(1)
-        assert "github.event.pull_request.base.sha" in snapshot_block
+        assert "github.event.pull_request.base.sha" in step("Snapshot base")
+        assert 'git checkout --detach "$BASE_REF"' in script("Snapshot base")
 
     def test_snapshot_step_runs_dbt_compile(self):
-        """Snapshot step runs dbt compile."""
-        snapshot_match = re.search(
-            r"- name: Snapshot base\s*\n\s*run: \|(.+?)(?=\n\s*- )", _CI_WORKFLOW, re.DOTALL
-        )
-        assert snapshot_match
-        assert "dbt compile" in snapshot_match.group(1)
+        assert "dbt compile" in script("Snapshot base")
 
     def test_snapshot_step_runs_dbt_plan_snapshot(self):
-        """Snapshot step runs dbt-plan snapshot."""
-        snapshot_match = re.search(
-            r"- name: Snapshot base\s*\n\s*run: \|(.+?)(?=\n\s*- )", _CI_WORKFLOW, re.DOTALL
-        )
-        assert snapshot_match
-        assert "dbt-plan snapshot" in snapshot_match.group(1)
+        assert "dbt-plan snapshot" in script("Snapshot base")
 
     def test_check_step_checks_out_head_sha(self):
-        """Check step checks out the head SHA."""
-        check_match = re.search(
-            r"- name: Check current\s*\n\s*run: \|(.+?)(?=\n\s*- )", _CI_WORKFLOW, re.DOTALL
-        )
-        assert check_match, "Check current step not found"
-        check_block = check_match.group(1)
-        assert "github.event.pull_request.head.sha" in check_block
+        assert "github.event.pull_request.head.sha" in step("Check current")
+        assert 'git checkout --detach "$HEAD_REF"' in script("Check current")
 
     def test_check_step_runs_dbt_compile(self):
-        """Check step runs dbt compile."""
-        check_match = re.search(
-            r"- name: Check current\s*\n\s*run: \|(.+?)(?=\n\s*- )", _CI_WORKFLOW, re.DOTALL
-        )
-        assert check_match
-        assert "dbt compile" in check_match.group(1)
+        assert "dbt compile" in script("Check current")
 
-    def test_check_step_uses_format_github(self):
-        """Check step runs dbt-plan check --format github."""
-        check_match = re.search(
-            r"- name: Check current\s*\n\s*run: \|(.+?)(?=\n\s*- )", _CI_WORKFLOW, re.DOTALL
-        )
-        assert check_match
-        assert "dbt-plan check --format github" in check_match.group(1)
+    def test_check_and_report_have_separate_formats(self):
+        assert "dbt-plan check --format json" in script("Check current")
+        assert "dbt-plan check --format github" in script("Report")
 
-    def test_gate_step_runs_dbt_plan_check(self):
-        """Gate step runs dbt-plan check (for exit code)."""
-        gate_match = re.search(r"- name: Gate\s*\n\s*run:\s*(.+?)(?:\n|$)", _CI_WORKFLOW)
-        assert gate_match, "Gate step not found"
-        assert "dbt-plan check" in gate_match.group(1)
+    def test_gate_uses_the_captured_code_instead_of_rechecking(self):
+        assert "steps.check.outputs.exit-code" in step("Gate")
+        assert "dbt-plan check" not in script("Gate")
+        assert "FAIL_ON: destructive" in step("Gate")
 
     def test_preflight_fails_when_credentials_missing(self):
         """Preflight step exits non-zero with an actionable message when the secret is empty."""
@@ -206,6 +220,7 @@ class TestStepsComplete:
             "install": _CI_WORKFLOW.index("name: Install"),
             "snapshot": _CI_WORKFLOW.index("name: Snapshot base"),
             "check": _CI_WORKFLOW.index("name: Check current"),
+            "report": _CI_WORKFLOW.index("name: Report"),
             "gate": _CI_WORKFLOW.index("name: Gate"),
         }
         ordered = sorted(positions.keys(), key=lambda k: positions[k])
@@ -216,6 +231,7 @@ class TestStepsComplete:
             "install",
             "snapshot",
             "check",
+            "report",
             "gate",
         ]
 
@@ -319,12 +335,12 @@ class TestFilePlacement:
         _run_ci_setup(tmp_path)
         assert (tmp_path / ".github" / "workflows").is_dir()
 
-    def test_exits_2_if_file_already_exists(self, tmp_path):
-        """Second call exits with code 2 when file already exists."""
+    def test_exits_3_if_file_already_exists(self, tmp_path):
+        """Second call exits with code 3 when file already exists."""
         _run_ci_setup(tmp_path)
         with pytest.raises(SystemExit) as exc_info:
             _run_ci_setup(tmp_path)
-        assert exc_info.value.code == 2
+        assert exc_info.value.code == 3
 
     def test_already_exists_message_includes_path(self, tmp_path, capsys):
         """Error message includes the workflow file path."""
@@ -349,21 +365,21 @@ class TestIdempotency:
         _run_ci_setup(tmp_path)
         assert wf_path.exists()
 
-    def test_second_call_exits_2(self, tmp_path):
-        """Second call exits with code 2."""
+    def test_second_call_exits_3(self, tmp_path):
+        """Second call exits with code 3."""
         _run_ci_setup(tmp_path)
         with pytest.raises(SystemExit) as exc_info:
             _run_ci_setup(tmp_path)
-        assert exc_info.value.code == 2
+        assert exc_info.value.code == 3
 
     def test_file_content_unchanged_after_failed_second_call(self, tmp_path):
         """File content is not modified when second call fails."""
         _run_ci_setup(tmp_path)
         wf_path = tmp_path / ".github" / "workflows" / "dbt-plan.yml"
-        original_content = wf_path.read_text()
+        original_content = wf_path.read_text(encoding="utf-8")
         with pytest.raises(SystemExit):
             _run_ci_setup(tmp_path)
-        assert wf_path.read_text() == original_content
+        assert wf_path.read_text(encoding="utf-8") == original_content
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +391,7 @@ class TestContentMatchesConstant:
     def test_file_content_is_exactly_ci_workflow(self, tmp_path):
         """The generated file content is exactly the _CI_WORKFLOW constant."""
         wf_path = _run_ci_setup(tmp_path)
-        assert wf_path.read_text() == _CI_WORKFLOW
+        assert wf_path.read_text(encoding="utf-8") == _CI_WORKFLOW
 
     def test_ci_workflow_constant_is_nonempty(self):
         """The _CI_WORKFLOW constant is a non-empty string."""
@@ -389,3 +405,78 @@ class TestContentMatchesConstant:
     def test_ci_workflow_ends_with_newline(self):
         """The constant ends with a newline (POSIX convention)."""
         assert _CI_WORKFLOW.endswith("\n")
+
+
+_RELEASE_WORKFLOW = Path(__file__).parents[1] / ".github" / "workflows" / "release.yml"
+
+
+class TestRegistryPublishJob:
+    """Republishing server.json to the MCP registry, and the separation that keeps it safe.
+
+    The registry entry carries a version. Skipping the republish leaves it advertising
+    a release that is no longer current, so an agent installing from the registry gets
+    an older dbt-plan than the entry claims.
+    """
+
+    @staticmethod
+    def _job(name: str) -> str:
+        """Body of one job, with comments stripped.
+
+        Comments are removed before splitting because a comment block sits between
+        the jobs at the same indentation, so a naive boundary match attributes it to
+        the job above -- and the prose in it discusses the very permissions these
+        tests assert are absent. Parsing the YAML properly would be better, but
+        pyyaml is not in the test extra and CI installs only that, so a guard
+        depending on it would silently skip exactly where it matters.
+        """
+        lines = [
+            line
+            for line in _RELEASE_WORKFLOW.read_text(encoding="utf-8").splitlines()
+            if not line.lstrip().startswith("#")
+        ]
+        block = re.search(
+            rf"^  {name}:\n(.*?)(?=^  [a-z-]+:\n|\Z)", "\n".join(lines) + "\n", re.M | re.S
+        )
+        assert block, f"{name} job not found in release.yml"
+        return block.group(1)
+
+    def test_it_is_a_separate_job_from_the_one_holding_the_pypi_token(self) -> None:
+        """The whole reason it is not folded into `release`.
+
+        `release` carries PYPI_API_TOKEN. Adding `id-token: write` there would put a
+        long-lived publishing secret and the ability to mint OIDC tokens for any
+        audience in the same job. Splitting them costs one checkout.
+        """
+        release = self._job("release")
+        publish = self._job("publish-registry")
+
+        assert "id-token: write" not in release
+        assert "id-token: write" in publish
+
+    def test_the_publish_job_holds_no_secrets(self) -> None:
+        publish = self._job("publish-registry")
+
+        assert "secrets." not in publish, (
+            "registry publishing authenticates through GitHub OIDC; a secret here "
+            "means someone reintroduced one that is not needed"
+        )
+
+    def test_it_runs_only_after_the_release_succeeded(self) -> None:
+        """PyPI and the GitHub Release come first, so a registry failure loses nothing."""
+        assert "needs: release" in self._job("publish-registry")
+
+    def test_the_publisher_binary_is_pinned_and_checksummed(self) -> None:
+        """It is fetched with curl rather than as an action, so the allowlist and SHA
+        pinning that cover `uses:` do not apply. The checksum is what replaces them."""
+        publish = self._job("publish-registry")
+
+        assert re.search(r"VERSION: v\d+\.\d+\.\d+", publish), "publisher version not pinned"
+        assert re.search(r"SHA256: [0-9a-f]{64}", publish), "publisher binary not checksummed"
+        assert "sha256sum -c -" in publish, "checksum declared but never verified"
+
+    def test_it_validates_before_authenticating(self) -> None:
+        """The registry caps description at 100 characters and returns 422. Finding that
+        after login is the same failure, later and noisier."""
+        publish = self._job("publish-registry")
+
+        assert publish.index("mcp-publisher validate") < publish.index("login github-oidc")

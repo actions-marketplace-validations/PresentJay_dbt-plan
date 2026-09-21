@@ -7,6 +7,762 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-09-15
+
+### Added
+
+- Add regression fixtures for PostgreSQL, BigQuery, Snowflake, DuckDB and Trino
+  projection syntax, covering the dialects users can select in compiled SQL.
+  (#201–#205, #211–#213, #233–#240)
+- Document warehouse-free reproduction, terminal output precedence, configuration
+  syntax, the stats report, Windows development and the first-run onboarding path.
+  (#206, #207, #214–#216, #241, #290)
+
+### Fixed
+
+- Parse inline unit-test CSV headers with Python's strict CSV parser instead of
+  splitting on commas. Malformed, blank and duplicate headers remain review-required
+  rather than being treated as reliable column evidence. (#227, #287)
+
+## [0.16.0] - 2026-09-09
+
+### Breaking
+
+- Reject unsupported, empty and unknown `--select` terms with exit 3 and no completed
+  report, including mixed valid/invalid selections. Existing unchanged selections
+  remain valid. Versioned models require an explicit version/file name. (#145, #101)
+- Execution failures now exit 3; completed warning findings still use `warning_exit_code`
+  (default 2). Invalid arguments, missing/invalid artifacts, compile/recovery failures,
+  and unexpected CLI exceptions cannot masquerade as warning/destructive verdicts.
+  Unreadable config is an error instead of silently loading defaults, and code 3 is
+  reserved from warning configuration. See [migration instructions](docs/exit-codes.md). (#113)
+
+### Added
+
+- Add a first-contribution guide with verified, scoped starter tasks. (#209)
+- Compare snapshot and Python-model changes through manifests, including projects
+  with no compiled SQL models. Changed Python models require review; DataFrame
+  schema inference remains unsupported. (#138, #144)
+- Report dialect selection and baseline revision/time, and support an explicit
+  instruction file with `agent-setup --file`. (#149, #170)
+- Check unchanged downstream contracts and surface exposure owners when safe
+  table/view replacement removes columns. (#159, #169)
+- Required CI compares pinned real compilation with committed fixtures and executes
+  the composite Action against safe, warning, destructive and failed-compile projects.
+  A reproducible CLI benchmark replaces unsupported timing claims. (#164)
+
+### Fixed
+
+- Validate source content and compilation evidence for models and relevant data
+  tests. Partial compiles and orphaned test SQL no longer establish safety; shared
+  source warnings survive selection filtering and the diagnostic path limit.
+  (#133, #152, #168, #191, #200)
+- Detect relation/config changes with unchanged SQL and casts added or removed on
+  one side of an incremental change. (#140, #141)
+- Expand EXCLUDE/EXCEPT against known columns and retain readable names alongside
+  unknown projections. Refuse case-sensitive quoted identities rather than
+  folding them into false matches. (#142, #154, #160)
+- Inspect generic-test SQL even for local macros and built-in overrides; resolve
+  versioned unit-test inputs and propagate losses through ephemeral models.
+  (#143, #157, #167)
+- Validate SQL snapshot files with dbt's whole-file checksum and recognize
+  snapshot-only layouts containing compiled data tests. (#138, #200)
+- Treat projection reordering alone as no schema DDL under sync_all_columns. (#168)
+- Preserve the worktree, index and recovery information across run/stash failures. (#195)
+- Repair sample projections and synchronize generated English/Korean examples. (#163)
+- Resolve selection graph nodes and version aliases to compiled file stems, including
+  `defined_in`. Aliases no longer create phantom missing/deleted artifacts. Real-dbt
+  tests cover graph operators, explicit versions and invalid-selection recovery. (#101)
+- The Action preserves manifest dialect detection when its dialect input is empty;
+  explicit overrides apply consistently to JSON, summary and text reports. (#134)
+- Generated CI installs dbt/project dependencies and dbt-plan in one environment
+  for uv projects or requirements.txt layouts, honors existing uv locks, and keeps
+  the environment outside revision checkouts. Capture and validate the check report
+  before rendering; Gate defaults to destructive-only and always blocks execution
+  errors. The checked-in example now exactly matches the generator. Regenerate
+  existing workflows and review custom settings to adopt the new policy. (#166)
+- Non-UTF-8 compiled SQL produces a review finding, including added models, instead
+  of an uncaught exception. All model SQL analysis paths share the guarded read. (#173)
+- The Action captures nonzero check results under Bash errexit so verdicts reach
+  the gate and execution failures produce an explicit error. Require a JSON report
+  before applying policy so errors from older pinned packages cannot pass as warnings.
+- Refuse incomplete baseline snapshots instead of interpreting missing SQL as safe additions. (#158)
+- Read UNION projections from the left branch; refuse PIVOT/UNPIVOT star expansion and avoid CTE shadowing of qualified physical relations. (#161)
+- MCP verdicts preserve warnings and acknowledged destructive findings, and include stale-source and unreadable-test refusals. (#162)
+- Warn on changed or unknown columns under incremental `on_schema_change: ignore`: no schema DDL does not imply a successful build. New models and unchanged known columns remain safe. (#139)
+
+## [0.15.0] - 2026-09-07
+
+### Added
+- Custom target-directory support in `run`, the GitHub Action, and MCP. (#172)
+- Contributor CI feedback: an automatically updated PR comment, status refresh,
+  controlled retries, and maintainer-only execution approval. (#184, #186)
+
+### Changed
+- Generated CI workflows run for every pull request, including changes outside
+  conventional model and macro paths. Regenerate existing workflows to adopt this. (#181)
+- Long generated data-test names are shortened in human-readable output; JSON
+  retains the full names. (#179)
+- Documented the JSON output contract and explained missing verdicts in generated
+  agent setup guidance. (#180, #178)
+
+### Fixed
+- `run` forwards acknowledgements to `check`. (#125)
+- MCP verdicts no longer report safe when unresolved refusals remain. (#137)
+- `run --format json` keeps snapshot progress on stderr so stdout remains JSON. (#175)
+- Unreadable baselines produce an explicit warning instead of a quiet successful
+  result, including in MCP output. (#176)
+- Added regression coverage tying cascade risk names to the severity table. (#126)
+
+- **A view whose SQL will not parse no longer exits 0.** (#131) A parse failure was
+  recorded only for materializations other than `table` and `view`, on the reasoning
+  that `CREATE OR REPLACE` is safe whatever the columns are. That is true of the model
+  and false of everything reading it: with the column sets unknown, cascade cannot see
+  which column was dropped, so `BROKEN_REF` never fired and the run exited 0 while the
+  report said `SAFE`.
+
+  ```
+  stg_f:  SELECT id, customer_id, {% if x %}a{% endif %} FROM raw.orders
+       -> SELECT id, {% if x %}a{% endif %} FROM raw.orders
+  fct_f:  SELECT customer_id FROM stg_f
+  ```
+
+  Same SQL as a `view`: `SAFE`, exit 0, nothing about `fct_f`. As an `incremental`:
+  `Could not extract columns`, exit 2. Only the materialization differed, and
+  `view`/`table` are what most dbt projects are made of.
+
+  The model's own verdict still reads `SAFE` -- `CREATE OR REPLACE VIEW` is what dbt
+  will run. The refusal is reported beside it, so "this DDL is safe and I cannot tell
+  you what it does to anything downstream" stays sayable, and the exit code follows the
+  refusal rather than the verdict.
+
+- **A deleted model is reported.** (#127) `dbt compile` never removes what it wrote
+  before, so a model deleted from the source left its compiled SQL in `target/`, the
+  diff found identical bytes on both sides, and `check` said `no model changes
+  detected`. The `MODEL REMOVED -> DESTRUCTIVE` rule that exists for exactly this
+  case could never fire in the normal flow -- only after `dbt clean`.
+
+  The manifest is the authority now: a model the base manifest had and the current
+  one does not is gone, whatever `target/` still contains, and it goes through the
+  removed-model rule and the cascade like any other removal.
+
+- **A column read two hops away, through a `SELECT *` passthrough, is a broken ref
+  again.** 0.14.0's resolved cascade asked about one relation -- the model that
+  changed -- and a downstream model that reads the column from the passthrough never
+  mentions that model. The resolver said `[]`, which was true and beside the point,
+  and that answer suppressed the text search that had caught it by accident.
+
+  ```
+  stg_orders:  SELECT order_id, customer_id  ->  SELECT order_id
+  mid:         SELECT * FROM stg_orders
+  fct_twohop:  SELECT customer_id FROM mid
+  ```
+
+  Measured on dbt 1.11.7: `dbt build` fails `fct_twohop`; 0.14.0 reported nothing
+  about it. A regression introduced the same day, found by a gap audit, and fixed
+  by checking every downstream model against every model that is losing a column,
+  not only the one that changed.
+
+  That is downstream x lost-models questions, and asking each one by re-qualifying
+  the SQL put a 200-model chain at 38 seconds. Each downstream model is now parsed
+  once and answers for every relation it names -- 0.5s, where 0.14.0 was 0.5s.
+
+- **A model with an `alias:` config is found by its relation.** Compiled SQL names
+  the relation a model writes to, never the model, so the resolved reader looked for
+  a table called `stg_orders` in SQL that says `orders_clean`. It was caught by the
+  text fallback refusing rather than by design; the reader now knows every name a
+  model is known by, from the relation index it already had.
+
+
+## [0.14.0] - 2026-09-05
+
+### Added
+- **A contract's declared `data_type` is now compared with the SQL's cast.** (#103)
+  0.13.0 shipped contract checking by column name and said types were out of reach,
+  because deciding that `varchar` and `TEXT` differ needs a per-adapter type table.
+
+  They are compared by **family** instead -- text against number against date/time
+  against boolean -- which is the line dbt's own behaviour draws. Measured against
+  dbt 1.11.7 with a contract declaring `varchar`:
+
+  ```
+  CAST('c' AS TEXT)    -> builds
+  CAST(5 AS INTEGER)   -> | customer_id | INTEGER | VARCHAR | data type mismatch |
+  ```
+
+  ```
+  CONTRACT VIOLATION: customer_id declared varchar, cast as INT -- data type mismatch
+  ```
+
+  Deliberately not reported: a widening inside a family (`int` to `bigint`), a type
+  neither side can be placed in one (`variant`, a struct), and a column with no
+  explicit cast -- its type is whatever the warehouse infers, which dbt-plan does
+  not ask. Casts are read only under an enforced contract, since that is the one
+  place dbt checks the declaration against the SQL.
+- **`dbt-plan run --against main`.** (#114) The baseline was HEAD of the current
+  branch, so a change you had already committed was not in the comparison:
+
+  ```
+  $ git commit -am "drop status"
+  $ dbt-plan run
+  dbt-plan -- no model changes detected
+  ```
+
+  That is a `DROP COLUMN` against a table with data in it, reported as nothing --
+  and "before opening a pull request", which is what the command is for and what
+  the instructions `dbt-plan agent-setup` writes tell an agent to do, is exactly
+  when the interesting changes are committed already. `action.yml` had this right
+  all along; the local command did not.
+
+  `--against` compares with the **branch point**, not the tip, so nothing other
+  people merged while the branch was open is reported as yours.
+
+  The default is unchanged, because changing it would mean checking out another
+  commit on every run and moving someone's HEAD uninvited. What is new is that the
+  default says what it is:
+
+  ```
+  Baseline: your last commit (a1b2c3d). Anything already committed on this branch
+  is not compared -- pass --against main for that.
+  ```
+
+  The HEAD restore is structural, like the stash restore next to it, and HEAD comes
+  back *before* the stash is popped so the work lands on the tree it came from.
+
+### Changed
+- **Cascade detection resolves the reference instead of searching for the name.**
+  `docs/use-cases.md` apologised for this one -- "a column named `id` will match a
+  great deal" -- and the apology was earned:
+
+  ```sql
+  -- customer_id used to live here
+  SELECT o.order_id, c.customer_id, c.tier
+  FROM stg_orders o JOIN dim_customers c ON o.order_id = 1
+  WHERE 'customer_id' <> ''
+  ```
+
+  Nothing there reads `stg_orders.customer_id`. 0.13.0 reported it as a broken ref,
+  on three separate matches: the comment, the string literal, and the other table's
+  column of the same name. `dbt build` builds that model without complaint.
+
+  dbt-plan already knows every model's columns, from the project's own compiled SQL,
+  so the downstream model is now parsed against that schema and a break is reported
+  only when the name resolves to the changed relation.
+
+  Stars are deliberately not counted. `select *` never fails when a column
+  disappears -- it returns one column fewer -- and that loss is already reported, for
+  the model that inherits it.
+
+  **The text search is still there as the fallback.** When the SQL will not parse, or
+  a column cannot be attributed to a relation, dbt-plan drops back to it: a refusal
+  has to widen what gets reported, never narrow it.
+
+  Measured at 0.43-0.55s on the 200-model `SELECT *` chain, against 0.22s before and
+  a budget of 5s.
+
+### Fixed
+- **`dbt-plan run` no longer stashes its own snapshot, which could leave your work
+  in the stash.** (#119) `.dbt-plan/` is untracked, so `--include-untracked` took it;
+  `run` then wrote a new snapshot before popping, and the pop refused because the
+  untracked files it held already existed:
+
+  ```
+  Error: could not restore your stashed changes:
+  error: could not restore untracked files from stash
+    Your work is NOT lost -- it is still in the stash.
+  ```
+
+  The loud message was doing its job -- the work was recoverable, and the command
+  said exactly how. The bug is that a command which touched nothing of theirs left
+  someone's uncommitted work in a stash, on any project that had run `dbt-plan
+  snapshot` before.
+
+  The stash now excludes the snapshot directory by pathspec, so it stays in the tree
+  and the snapshot written during the block cannot collide with the pop. `:/` keeps
+  the rest of the repository included, so a dbt project in a subdirectory still gets
+  the whole tree stashed. `run` also stops counting the snapshot as a change at all,
+  so an otherwise clean tree is not stashed for it.
+
+  Not fixed by gitignoring the snapshot from `snapshot`, which was the first attempt:
+  that write lands inside `run`'s stash window and makes `.gitignore` the file the pop
+  cannot restore -- the same failure one step along.
+- **A failed `dbt compile` is no longer reported as a clean run.** (#106) dbt-plan
+  reads `target/`, and nothing in `target/` says whether it is current. Measured on
+  jaffle_shop:
+
+  ```
+  $ dbt compile          # exit 2, nothing recompiled
+  $ dbt-plan check
+  dbt-plan -- no model changes detected
+  exit=0
+  ```
+
+  The column really was gone. Not a rule getting the wrong answer -- every rule
+  answering about code the user no longer had.
+
+  A source file newer than the manifest that claims to describe it is the signal,
+  and it costs one `stat` per file. The directories to look in come from the
+  manifest's own `original_file_path` values, so `macro-paths` and `test-paths` are
+  covered wherever they are, and package files are left out -- their mtimes move
+  when `dbt deps` runs, not when anyone edits.
+
+  ```
+  WARNING: target/ may be out of date -- models/staging/stg_orders.sql is newer than
+  the manifest. Recompile, or this report describes code you no longer have.
+  ```
+
+  It survives an otherwise empty report, because an empty diff is exactly what a
+  failed compile produces, and it drives the exit code for the same reason. `--format
+  json` gains a `stale_sources` key.
+
+  One direction only: a `git checkout` moves mtimes without changing content, and
+  reports a `target/` that really is stale. A file **deleted** since the compile is
+  not caught -- a deletion leaves no mtime behind.
+- **`dbt-plan run --select` documented the graph operators it already supported.**
+  (part of #116) 0.13.0 taught `--select` dbt's `model+` syntax and updated only the
+  `check` parser's help. `run` hands the value straight to the same code, so the
+  feature worked and the help said otherwise.
+- **A project that renames `model-paths` is no longer refused.** (#95) `model-paths`
+  is configurable in `dbt_project.yml`, and dbt-plan assumed it was `models`:
+
+  ```
+  # model-paths: ["transformations"]
+  $ dbt compile
+  $ dbt-plan snapshot
+  Error: No compiled SQL found. Run 'dbt compile' first to generate compiled SQL
+  in the target/ directory.
+  ```
+
+  The compile was right there. The message named the one thing the user had already
+  done, which sends them to check dbt rather than dbt-plan.
+
+  A project listing **several** paths was worse: `models/` was scanned and the rest
+  were skipped without a word, so a change in one of them was never diffed. That is
+  a missed finding, not an error.
+
+  No `dbt_project.yml` parsing was needed for either -- every model node records
+  where it was declared, in `original_file_path`.
+
+  `dbt-plan snapshot` now saves the project's compiled root rather than its model
+  directory, so the snapshot layout gained one level. A snapshot taken by an earlier
+  version is detected and compared as before, rather than being read as an empty
+  baseline and reporting every model as added.
+
+### Documentation
+- **`docs/use-cases.md` now reports what dbt-plan says on jaffle_shop.** (#98) Every
+  other example on that page uses a project written to show the tool working. This
+  one is a project anyone can clone: seven ordinary changes, the output length and
+  exit code for each, no false positives and no misses, and both destructive
+  predictions checked against `dbt build`. It also records the two things
+  jaffle_shop cannot exercise -- it has no incremental models, so every model-level
+  verdict there is `SAFE` and every finding came from cascade.
+
+## [0.13.0] - 2026-09-05
+
+### Added
+- **`--select` understands dbt's graph operators.** (#31) It was an exact
+  set-membership test, so `fct_orders+` matched nothing and the run reported "no
+  changed models" for a filter its author believed was broader.
+
+  ```bash
+  dbt-plan check --select fct_orders    # one model
+  dbt-plan check --select fct_orders+   # it and everything downstream
+  dbt-plan check --select +fct_orders   # it and everything upstream
+  ```
+
+  Only these three, because they are the ones dbt-plan already holds the graph
+  for. `tag:` and `path:` are reported on stderr rather than quietly matching
+  nothing -- a `--select` narrower than intended hides findings, which is the
+  failure worth being loud about.
+- **A change an enforced contract will reject is now reported.** (#87) dbt-plan read
+  no contract information at all -- `grep -rn contract src/dbt_plan/` returned one
+  docstring -- so a change dbt refuses to build reported SAFE.
+
+  ```
+  WARNING  fct_contract (table, ignore)
+    CONTRACT VIOLATION: customer_id missing in definition
+    CREATE OR REPLACE TABLE
+  ```
+
+  The wording is dbt's own, from the table it prints when it refuses the model.
+
+  Under an enforced contract the ordinary rules invert: dbt requires every column
+  to be declared, so a column **added** to the SQL fails the build exactly as a
+  removed one does. Everywhere else in dbt-plan an added column is safe and a
+  `table` is `CREATE OR REPLACE`.
+
+  Names only. dbt compares its declared `data_type` against what the warehouse
+  reports; dbt-plan sees only what the SQL casts explicitly, and deciding that
+  `varchar` and `TEXT` are the same claim needs a per-adapter type table that does
+  not exist here. Both measured failures are name mismatches.
+
+  Columns that cannot be read from the SQL become REVIEW REQUIRED rather than
+  silence -- a contract makes that refusal more important, not less, since the one
+  thing the author stated is the thing going unchecked.
+
+- **Data tests broken by a dropped column are now reported.** (#85, #86) This closes
+  a false all-clear, and the most common one left: unit tests are rare, `not_null`
+  is in nearly every dbt project.
+
+  A `not_null` on a dropped column is not a failing assertion, it is a query dbt
+  cannot bind:
+
+  ```
+  Failure in test not_null_stg_orders_customer_id (models/schema.yml)
+    Binder Error: Referenced column "customer_id" not found in FROM clause!
+    Candidate bindings: "order_id"
+  ```
+
+  0.12.0 reported `SAFE  stg_orders (view, ignore)` and exited 0.
+
+  A generic test names its column in the manifest, so `not_null`, `unique` and
+  `accepted_values` are answered without reading a file. `relationships` is the one
+  built-in that reads a second model, and the far side is named only in its kwargs;
+  that is matched too. A singular test names nothing in the manifest, so its
+  compiled SQL is searched — which meant indexing `target/compiled/<project>/tests/`,
+  outside the `models/` tree dbt-plan scans. A test whose SQL cannot be found is
+  reported as unreadable rather than passed over.
+
+  Tests on a model that inherits the loss through a `SELECT *` are caught as well.
+  Neither this nor #24 covered that alone: a downstream `table` is rebuilt safely, so
+  the inherited-loss check stays quiet, while the `not_null` on it still cannot bind.
+
+### Changed
+- **The dialect is read from the manifest.** (#27) `--dialect` defaulted to
+  `snowflake`, and `metadata.adapter_type` had been sitting in the file dbt-plan
+  parses on every run. A BigQuery or Postgres project with no flag passed was
+  parsed as Snowflake. Precedence is unchanged where anyone spoke:
+  `--dialect` > `DBT_PLAN_DIALECT` > `.dbt-plan.yml` > the manifest > `snowflake`.
+  An adapter sqlglot has no dialect for falls back rather than failing.
+
+  `dbt-plan stats` was reading neither the config file nor the environment for
+  this; it now resolves it the same way `check` does.
+
+- **An enforced contract makes the manifest columns trustworthy.** (#28) 0.10.0
+  stopped a `SAFE` verdict built from manifest columns being reported as safe,
+  because `schema.yml` conventionally documents only the columns you test -- the
+  same partial list lands on both sides of the diff and cancels out. A contract is
+  the case where that reasoning does not hold: dbt requires every column to be
+  declared and fails the build otherwise. Those models are now analysed rather
+  than escalated to review.
+
+- **Snapshots say what changed.** (#30) Every snapshot got
+  `REVIEW REQUIRED (snapshot)` and nothing else, though the column diff had
+  already been computed and thrown away. The verdict is deliberately unchanged --
+  snapshot schema changes are not auto-managed, and the `dbt_valid_from` columns
+  are invisible to a compiled-SQL diff -- but the report now names the columns.
+  Along the way, a `SELECT *` on either side is no longer differenced into
+  `DROP COLUMN *`, which affected the unknown-materialization report too.
+
+### Fixed
+- **The guard against materializations dbt-plan has no rule for now actually fires.**
+  (#91) This closes a false all-clear that has been live since 0.11.0 added the
+  guard.
+
+  ```python
+  if materialization != "incremental" and on_schema_change is None:
+  ```
+
+  dbt resolves `on_schema_change` for **every** model, so a view, a materialized
+  view and a custom materialization all carry `'ignore'` whether or not anyone
+  wrote it. The guard never saw `None`, fell through to the incremental rules, and
+  answered with the thing it was written to prevent. Measured on dbt 1.11.7, a
+  materialized view dropping a column:
+
+  ```
+  SAFE  mv_thing (materialized_view, ignore)
+    NO DDL
+  exit=0
+  ```
+
+  `on_schema_change` is now read from `unrendered_config`, which carries only what
+  a human wrote -- in the model or in `dbt_project.yml`. An explicit setting is
+  still honoured, so a custom materialization declared `sync_all_columns` still
+  earns a destructive verdict. A manifest too old to have `unrendered_config` keeps
+  the resolved value for `incremental`, whose default is dbt's own documented rule,
+  and refuses for everything else.
+
+- **`dbt-plan stats` no longer contradicts `dbt-plan check`.** (#52) It reported
+  `SELECT * usage: 1/5` and `Coverage: 5/5 models fully analyzed` one line apart.
+
+  - The `SELECT *` count ran the extraction **without** the resolver `check`
+    passes, so a `select * from {{ ref(x) }}` that check expands through the DAG
+    was counted as unanalysable -- and the advice underneath it, "add column docs
+    to resolve", was wrong for exactly those models. There are now two lines:
+    how many models write `*`, and how many models' columns dbt-plan can read.
+  - "Coverage" counted materializations, not analysability. It left out
+    `append_new_columns` and `ignore`, which dbt-plan analyses exactly, and never
+    learned about #41. It is now `DDL rules: N/M`, derived by asking `predict_ddl`
+    rather than restating the table, and it names the materializations with no
+    rule instead of leaving you to work out which.
+  - Both counts now run over the same index `check` builds, so package models and
+    disabled ones are out of both.
+- **Versioned models are analysed instead of skipped.** (#53) Two versions of a
+  model share one dbt name, and the node_id carries the version where every other
+  model carries its name -- `model.p.fct_orders.v2`. dbt-plan read that last
+  segment as the model name, so:
+
+  ```
+  dbt-plan -- 0 model(s) changed
+  WARNING: Skipped 1 model(s) not found in manifest: fct_orders_v2
+  WARNING: The compile is incomplete -- 1 model(s) in the manifest have no
+           compiled SQL: fct_orders
+  ```
+
+  A `sync_all_columns` DROP COLUMN went entirely unanalysed under those two
+  warnings. It now reports
+  `DESTRUCTIVE fct_orders_v2 (incremental, sync_all_columns)` and exits 1.
+
+  The index is keyed by the name the compiled file was written under throughout,
+  since the diff is a comparison of files. `defined_in:` is honoured -- the node's
+  own `path` is the authority, with the derived `<name>_v<n>` kept as an alias so
+  both spellings resolve. Two versions no longer collapse into one entry either;
+  they can differ in materialization and `on_schema_change`, and only the first
+  used to be indexed.
+
+## [0.12.0] - 2026-09-05
+
+### Added
+- **A model that loses a column without its own file changing is now reported.**
+  (#24) This closes a false all-clear.
+
+  ```
+  stg_orders:  SELECT order_id, customer_id, status  ->  SELECT order_id, status
+  fct_orders:  SELECT * FROM {{ ref('stg_orders') }}  ->  byte-identical
+  ```
+
+  `fct_orders` loses `customer_id` too, and on `incremental` + `sync_all_columns`
+  dbt issues a DROP COLUMN against a table with data in it. Measured on duckdb:
+
+  ```
+  alter table "dev"."main"."fct_orders" drop column
+  ```
+
+  0.11.2 reported `SAFE  stg_orders (view, ignore)` and exited 0. The diff only
+  carries models whose own file changed, and the broken-ref check looks for the
+  column by name in SQL that never names it.
+
+  Both sides of an unchanged downstream model are now resolved through `ref()`
+  from the project's own compiled SQL and run back through `predict_ddl`, so the
+  verdict follows the same materialization rules as any other model. A downstream
+  model that rebuilds itself -- `table`, `view`, `incremental` + `ignore` -- is
+  still safe and still silent. One whose columns cannot be read on both sides
+  gets REVIEW REQUIRED where its configuration allows a drop.
+
+  Measured at 0.20-0.30s on a 200-model project chained entirely by `SELECT *`,
+  the worst case for this, against a budget of 5s.
+
+### Changed
+- **Long cascade lists are truncated in the text and GitHub reports.** One
+  `SELECT *` chain can put every model in the project downstream of one change,
+  and a hundred bullets in a pull request comment is a wall nobody reads. Sorted
+  worst-first before the cut, so it only ever removes the least severe;
+  `--format json` still carries all of them.
+
+- **Exposures downstream of a change that is not safe are now named, with their
+  owners.** (#44) An exposure records that something outside the project -- a
+  dashboard, a notebook, a reverse-ETL sync -- reads a model. `find_downstream`
+  walked into them and `build_node_index` dropped them, so the report never
+  mentioned the people who most needed telling:
+
+  ```
+  -- EXPOSURE  orders_dashboard (dashboard) -- owner: Data Team <data@example.com>
+  ```
+
+  An exposure declares its dependencies at model granularity, with no columns in
+  it, so this never claims a dashboard breaks. It is deliberately not a risk and
+  deliberately does not escalate the verdict: an exposure existing does not make
+  a change more dangerous, and inflating the verdict for it would train people to
+  ignore the line. For the same reason it is left off safe verdicts.
+
+- **Unit tests downstream of a dropped column are now reported.** (#43) A dbt unit
+  test pins its columns down by hand, in `expect` and in every `given` input, and
+  dbt checks each of those against the real relation it stands for:
+
+  ```
+  Invalid column name: 'customer_id' in unit test fixture for 'stg_orders'.
+  Accepted columns for 'stg_orders' are: ['order_id', 'store_id', 'order_date']
+  ```
+
+  So dropping a column fails the build even when the model's own DDL is safe --
+  a view is `CREATE OR REPLACE`, and dbt-plan called that SAFE while `dbt build`
+  was going to stop. It is now a `UNIT_TEST_FAILURE` cascade risk and a warning.
+
+  Both the `expect` block of the changed model's own tests and the `given` inputs
+  of tests further downstream are checked, since a `given` fixture standing in for
+  the changed model is validated the same way. Only fixtures that stand for the
+  changed model are compared. Only removals are reported: adding a column leaves
+  every fixture passing, measured against dbt 1.11.7.
+
+  A fixture that cannot be read from the manifest -- `fixture:` file references,
+  `format: sql` -- is reported as `UNIT_TEST_UNREADABLE` rather than passed over.
+
+### Fixed
+- **dbt-plan no longer treats compiled unit test SQL as a model.** `dbt build`
+  writes unit tests into `target/compiled/` alongside the models, under a
+  directory named for the schema file that declared them. dbt-plan diffed them
+  as models, so any project with unit tests got a spurious
+  `Skipped N model(s) not found in manifest` on every run -- and two models that
+  each carried a `test_shape` aborted the run outright on the duplicate-name
+  check. Anything under a `*.yml` path segment is now skipped.
+
+## [0.11.2] - 2026-09-05
+
+### Added
+- **An `mcp-name:` line in the README, so the MCP registry will accept the entry.**
+  The registry will not take a PyPI-backed server on the publisher's word that they
+  own the package: it fetches the package page and looks for the server name spelled
+  `mcp-name: io.github.PresentJay/dbt-plan`. Without it, `mcp-publisher publish`
+  fails with a 400 and no entry is created.
+
+  It checks the README on PyPI, not the one on GitHub, and the PyPI page is only
+  rebuilt by a release — which is what this release is for. `tests/test_packaging.py`
+  now fails if the line is dropped, because otherwise dropping it costs nothing until
+  the next release, by which point the cause is several commits back.
+
+  No source changes.
+
+## [0.11.1] - 2026-09-05
+
+### Changed
+- **Documentation only, released so PyPI stops describing the tool by the wrong
+  axis.** The PyPI page is built from `README.md` and only updates on a release,
+  and it is currently the first search result for this project — so the page most
+  people read was still framing dbt-plan as a CI check.
+
+  It is used the way `terraform plan` is used: before the command that changes
+  the warehouse, not only in CI afterwards. The README now leads with that loop,
+  states the measured cost of running it (`check` 0.11s on 3 models, 0.48s on 200
+  with every one changed — the `dbt compile` is the whole cost and you were paying
+  it anyway), and surfaces `agent-setup` in Quick Start rather than fourth in a
+  command list.
+
+  `docs/use-cases.md` gains a first case with no cheap alternative anywhere else:
+  a macro change. One line removed from a macro, no model file touched, and
+  `fct_orders` loses a column from a table that has data in it. The pull request
+  diff is two lines and says none of that.
+
+  No source changes.
+
+## [0.11.0] - 2026-09-03
+
+### Removed
+- **The `include_packages` config key and `DBT_PLAN_INCLUDE_PACKAGES`.** It
+  claimed to "also check models from dbt packages" and never did. It widened the
+  manifest index to keep package models, while the compiled scan covers the root
+  project's directory alone — so those models were indexed and then never
+  examined.
+
+  It was worse than a no-op. The uncompiled-model check added in 0.7.0
+  cross-references the manifest against the compiled directory, found those
+  entries with no compiled SQL, and reported **"the compile is incomplete — fix
+  the compile and rerun"** about a compile that was fine. The advice could not be
+  followed, because there was nothing to fix.
+
+  Setting it now warns, with the line number, that it is ignored. Removing the
+  key outright would have been silent, and this way a stale config says what
+  happened rather than quietly changing meaning.
+
+  Making it work would mean scanning several project directories, which runs into
+  `diff_compiled_dirs` refusing on a duplicate file stem — dbt requires model
+  names to be unique per package, not globally, so a collision is legal. That is a
+  real design question and not worth opening for a feature whose only observable
+  effect was a wrong warning. The finding that matters — a package model dropping
+  a column one of your models reads — is already caught as a broken ref by
+  cascade analysis.
+
+  `build_node_index(include_packages=True)` is untouched. That was the half that
+  worked, it stays tested, and it is the hook if the scan is ever widened.
+
+## [0.10.1] - 2026-09-03
+
+### Fixed
+- **A dbt package that ships models no longer stops dbt-plan from running.**
+  dbt compiles every installed package into its own directory under
+  `target/compiled/`, and `_find_compiled_dir` treated more than one as
+  unresolvable and aborted. Any project depending on elementary,
+  dbt_project_evaluator, dbt_artifacts or similar could not run `snapshot` or
+  `check` at all.
+
+  The error also suggested `--project-dir`, which does not help: that flag points
+  at the dbt project, and the competing directories are inside *that project's*
+  `target/`. Passing it produced the identical message, so the only advice given
+  was a dead end.
+
+  The root project is now identified from `metadata.project_name` in the
+  manifest — the same field `build_node_index` already uses to keep package
+  models out of the index. The file side and the manifest side now agree on which
+  project is yours.
+
+  Still refuses when it genuinely cannot tell: no manifest, an unreadable one, or
+  one naming a project that is not there. The message now points at the manifest
+  rather than at a flag that changes nothing. The manifest is read only when there
+  is more than one candidate, so the ordinary single-project case does not start
+  paying to parse the largest file dbt writes.
+
+## [0.10.0] - 2026-09-02
+
+### Fixed
+- **A materialization dbt-plan has no rule for is no longer reported safe.**
+  `predict_ddl` handled `table`, `view`, `ephemeral` and `snapshot` by name and
+  fell through to the incremental branch for everything else. With no
+  `on_schema_change` set, that branch defaulted to `"ignore"` and returned
+  `SAFE / NO DDL` — so a `materialized_view`, a Snowflake dynamic table or a
+  custom materialization could drop a column and report clean.
+
+  It was reasoning with a setting that does not apply: dbt drives materialized
+  views with `on_configuration_change`, not `on_schema_change`, and its docs do
+  not say what a column change does to one. `materialized_view` now says exactly
+  that instead of a generic "unknown".
+
+  Note the asymmetry this closes. An unrecognized *`on_schema_change`* already
+  returned `WARNING`; an unrecognized *materialization* did not.
+
+### Changed
+- **An explicitly set `on_schema_change` is still honoured on any
+  materialization.** Setting it is an assertion by the author about how their
+  materialization behaves, so a custom materialization with `sync_all_columns`
+  still earns a `DESTRUCTIVE` verdict rather than being downgraded to a warning.
+  Only its *absence* is treated as unknown — silence is not a claim, and reading
+  it as `"ignore"` is what produced the false all-clear.
+
+  The verdict carries the column diff either way, since "unknown" with nothing
+  attached tells a reviewer nothing about what to look at.
+
+## [0.9.2] - 2026-09-02
+
+### Fixed
+- **Files are read and written as UTF-8 rather than as whatever the locale
+  happens to be.** `Path.read_text()` with no `encoding=` uses the locale codec,
+  which is cp1252 on Windows, so a UTF-8 file containing any non-ASCII byte
+  raised `UnicodeDecodeError`. dbt writes `manifest.json` as UTF-8 and compiled
+  SQL inherits the model's encoding, so **a project with a column description in
+  any language but English could not be read on Windows at all.** Twenty-two call
+  sites, covering compiled SQL, `manifest.json`, `.dbt-plan.yml`, `.gitignore`,
+  the generated CI workflow and the consumer's `AGENTS.md`.
+
+  `subprocess(text=True)` decodes the same way, so `git` and `dbt compile` output
+  is now decoded explicitly too — with `errors="replace"`, since crashing on
+  another tool's diagnostic output would be absurd and the values actually
+  consumed from it are commit ids and emptiness checks.
+
+  File reads stay strict: a genuinely mis-encoded compiled SQL file still raises,
+  and the caller treats that as "could not read", which is the safe direction.
+
+  It hit this project's own guarantees first. `tests/test_invariants.py` reads
+  `src/dbt_plan/cli.py` to assert the package imports no database driver, nothing
+  that reaches the network, and never passes `shell=True`. That file contains 72
+  non-ASCII bytes, so on Windows **the three checks enforcing this tool's security
+  premises did not run at all.**
+
+  Found because an outside contributor added a Windows CI matrix while fixing a
+  different bug (#38, #32). Nothing in this repository had ever run on Windows.
+
+### Added
+- An invariant test asserting that no `read_text` / `write_text` / `open` /
+  `subprocess(text=True)` call in `src/` omits its encoding, so this cannot
+  return quietly.
+
 ## [0.9.1] - 2026-09-01
 
 ### Fixed

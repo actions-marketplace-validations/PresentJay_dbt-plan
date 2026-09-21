@@ -9,18 +9,29 @@ dbt 버전의 `terraform plan`. 컴파일된 SQL로 동작 — `dbt compile`은 
 ```text
 $ dbt-plan check
 
-dbt-plan -- 2 model(s) changed
+dbt-plan -- 4 model(s) changed
+  dialect: snowflake (default; adapter: unknown)
+  baseline: unknown revision, unknown snapshot time
+
 
 DESTRUCTIVE  int_order_enriched (incremental, sync_all_columns)
+  ADD COLUMN  billing_method
+  ADD COLUMN  shipping_city
+  DROP COLUMN  billing_info
   DROP COLUMN  shipping_info
-  ADD COLUMN   shipping_city
-  Downstream: dim_customers, fct_orders (2 model(s))
-  >> BROKEN_REF  fct_orders: references dropped column(s): shipping_info
+  Downstream: dim_customers, fct_daily_sales (2 model(s))
+  >> BROKEN_REF  fct_daily_sales: reads dropped column(s): shipping_info
 
 SAFE  dim_customers (table)
   CREATE OR REPLACE TABLE
 
-dbt-plan: 2 checked, 1 safe, 0 warning, 1 destructive, 1 cascade risk(s)
+SAFE  dim_publishers (table)
+  CREATE OR REPLACE TABLE
+
+SAFE  fct_daily_sales (incremental, append_new_columns)
+  ADD COLUMN  total_sales
+
+dbt-plan: 4 checked, 3 safe, 0 warning, 1 destructive, 1 cascade risk(s)
 ```
 
 ## 무엇을 하는가
@@ -30,8 +41,8 @@ PR에서 dbt 모델이 변경되었을 때, 컴파일된 SQL 비교로:
 - **컬럼 변경 감지**: ADD/DROP COLUMN
 - **위험도 판정**: materialization × on_schema_change 규칙 기반
 - **하위 모델 영향 분석**: 삭제된 컬럼을 참조하는 downstream 모델 감지
-- **타입 변경 감지**: 양쪽에 명시적 `CAST`가 있는 컬럼의 타입 비교
-- **설정 변경 감지**: materialization/on_schema_change 정책 변경
+- **타입 변경 감지**: 명시적 `CAST`의 타입을 비교하고, 한쪽에만 CAST가 생기거나 사라져도 검토 요청
+- **설정 변경 감지**: materialization/on_schema_change 정책과 database/schema/alias 이동
 
 실행하지 않습니다. Warehouse에 접속하지 않습니다. 파일을 읽고, 비교하고, 경고합니다.
 
@@ -80,11 +91,14 @@ dbt-plan check --select model1   # 특정 모델만 체크
 | view | 무관 | `CREATE OR REPLACE VIEW` | SAFE |
 | ephemeral | 무관 | (물리 오브젝트 없음) | SAFE |
 | snapshot | 무관 | REVIEW REQUIRED | WARNING |
-| incremental | ignore | DDL 없음 | SAFE |
+| incremental | ignore | 스키마 DDL 없음; 기존 테이블의 컬럼 변경은 빌드 실패 가능 | 컬럼 변경·분석 불가 시 WARNING |
 | incremental | fail | 빌드 실패 | WARNING |
 | incremental | append_new_columns | `ADD COLUMN`만 | SAFE |
 | incremental | sync_all_columns | `ADD + DROP COLUMN` | 컬럼 삭제 시 DESTRUCTIVE |
 | 전체 | (모델 삭제) | MODEL REMOVED | DESTRUCTIVE |
+| 전체 | (알 수 없는 osc) | `UNKNOWN on_schema_change` | WARNING |
+| materialized_view / 커스텀 | (미설정) | `UNKNOWN materialization` | WARNING |
+| materialized_view / 커스텀 | (osc 설정됨) | incremental 규칙을 따름 | osc에 따름 |
 
 ## 지원 환경
 
@@ -92,6 +106,17 @@ dbt-plan check --select model1   # 특정 모델만 체크
 - 모든 warehouse: Snowflake, BigQuery, Redshift, Postgres, DuckDB 등 (`--dialect`)
 - Python 3.10+
 - CTE, UNION ALL, QUALIFY, 윈도우 함수, VARIANT 접근
+
+## 기여하기
+
+개발 환경과 기여 절차는 [CONTRIBUTING.md](CONTRIBUTING.md)를 참고하세요.
+
+**기여자 CI 안내:** 이 저장소에 PR을 열면 봇이 하나의 상태 댓글을 갱신해
+검사 대상 커밋, 실행 승인 대기 여부, 실패한 작업 링크를 알려줍니다.
+`/ci` 댓글로 상태를 새로고침하고, 일시적인 실행 오류는 `/ci retry`로 재시도할 수 있습니다.
+외부 기여의 실행 승인은 여전히 관리자가 처리하며, 재시도로 우회할 수 없습니다.
+[명령과 제한 사항](CONTRIBUTING.md#checking-ci-on-your-pull-request)을 확인하세요.
+이 기능은 dbt-plan 자체에 기여하는 PR용이며, 사용자 dbt 프로젝트에 설치하는 Action과는 별개입니다.
 
 ## 라이선스
 

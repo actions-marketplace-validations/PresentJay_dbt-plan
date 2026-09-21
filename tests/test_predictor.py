@@ -1,5 +1,7 @@
 """Tests for predict_ddl — DDL prediction rules."""
 
+import pytest
+
 from dbt_plan.predictor import Safety, predict_ddl
 
 
@@ -30,8 +32,8 @@ class TestTableAndView:
 
 
 class TestIncrementalIgnoreAndFail:
-    def test_incremental_ignore_safe(self):
-        """incremental + ignore → NO DDL, safe."""
+    def test_incremental_ignore_warns(self):
+        """Ignoring schema DDL does not guarantee a successful incremental build."""
         result = predict_ddl(
             model_name="fct_orders",
             materialization="incremental",
@@ -39,8 +41,8 @@ class TestIncrementalIgnoreAndFail:
             base_columns=["a", "b"],
             current_columns=["a", "c"],
         )
-        assert result.safety == Safety.SAFE
-        assert any(op.operation == "NO DDL" for op in result.operations)
+        assert result.safety == Safety.WARNING
+        assert any("BUILD FAILURE" in op.operation for op in result.operations)
 
     def test_incremental_fail_same_columns_safe(self):
         """incremental + fail + same columns → SAFE (no schema change)."""
@@ -161,8 +163,8 @@ class TestIncrementalAppendAndSync:
         assert result.columns_added == []
         assert result.columns_removed == []
 
-    def test_sync_reorder_warning(self):
-        """incremental + sync_all_columns + columns reordered → WARNING."""
+    def test_sync_reorder_safe(self):
+        """Projection order alone does not change dbt's column set or emit DDL."""
         result = predict_ddl(
             model_name="int_order_enriched",
             materialization="incremental",
@@ -170,8 +172,8 @@ class TestIncrementalAppendAndSync:
             base_columns=["a", "b", "c"],
             current_columns=["c", "a", "b"],
         )
-        assert result.safety == Safety.WARNING
-        assert any("REORDER" in op.operation for op in result.operations)
+        assert result.safety == Safety.SAFE
+        assert result.operations == []
 
 
 class TestNewModel:
@@ -353,8 +355,8 @@ class TestStarExceptPredictor:
         )
         assert result.safety == Safety.SAFE
 
-    def test_star_except_ignore_safe(self):
-        """Incremental + ignore with * except → SAFE (no DDL)."""
+    def test_star_except_ignore_warns(self):
+        """Ignoring schema DDL does not guarantee a successful incremental build."""
         result = predict_ddl(
             model_name="m",
             materialization="incremental",
@@ -362,7 +364,7 @@ class TestStarExceptPredictor:
             base_columns=["a", "b"],
             current_columns=["* except(revenue)"],
         )
-        assert result.safety == Safety.SAFE
+        assert result.safety == Safety.WARNING
 
 
 class TestEphemeralAndUnknown:
@@ -941,3 +943,47 @@ class TestAnalyzeCascadeImpacts:
 
         assert len(updated[0].downstream_impacts) == 1
         assert updated[0].downstream_impacts[0].risk == "broken_ref"
+
+
+class TestSnapshotsCarryTheirColumnDiff:
+    """The verdict stays review -- schema changes on a snapshot are not auto-managed.
+
+    But the diff was computed and then thrown away, so a reviewer was told "review
+    required" without being told what to review, on a change dbt-plan had already
+    worked out.
+    """
+
+    def test_a_dropped_column_is_named(self):
+        prediction = predict_ddl("s", "snapshot", None, ["a", "b"], ["a"])
+        assert prediction.safety == Safety.WARNING
+        assert [(op.operation, op.column) for op in prediction.operations] == [
+            ("REVIEW REQUIRED (snapshot)", None),
+            ("DROP COLUMN", "b"),
+        ]
+        assert prediction.columns_removed == ["b"]
+
+    def test_an_added_column_is_named(self):
+        prediction = predict_ddl("s", "snapshot", None, ["a"], ["a", "b"])
+        assert prediction.columns_added == ["b"]
+        assert ("ADD COLUMN", "b") in [(op.operation, op.column) for op in prediction.operations]
+
+    def test_an_unchanged_column_set_still_warns_with_nothing_attached(self):
+        """A `where` clause edit. The verdict question is deliberately left alone."""
+        prediction = predict_ddl("s", "snapshot", None, ["a", "b"], ["a", "b"])
+        assert prediction.safety == Safety.WARNING
+        assert [op.operation for op in prediction.operations] == ["REVIEW REQUIRED (snapshot)"]
+
+    @pytest.mark.parametrize(
+        "base,current",
+        [(["*"], ["a"]), (["a"], ["*"]), (None, ["a"]), (["a"], None), (["* except(b)"], ["a"])],
+    )
+    def test_a_star_is_never_differenced_into_a_column_name(self, base, current):
+        """`["*"]` stands for columns it could not enumerate. `DROP COLUMN *` is not a finding."""
+        prediction = predict_ddl("s", "snapshot", None, base, current)
+        assert [op.operation for op in prediction.operations] == ["REVIEW REQUIRED (snapshot)"]
+
+    def test_the_same_guard_covers_an_unknown_materialization(self):
+        prediction = predict_ddl("m", "some_custom_thing", None, ["*"], ["a"])
+        assert [op.operation for op in prediction.operations] == [
+            "UNKNOWN materialization: some_custom_thing"
+        ]

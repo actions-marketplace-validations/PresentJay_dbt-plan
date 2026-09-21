@@ -20,10 +20,10 @@ dbt-plan은 `dbt run` 전에 위험을 경고하는 **정적 분석 도구**다.
 3. **가볍고 빠르다 (No Runtime Dependency)**
    - sqlglot 외 런타임 의존성 없음
    - Warehouse 접속 불필요
-   - 200개 모델 프로젝트에서 < 5초
+   - 성능 목표: 200개 모델 분석 < 5초 (환경·쿼리에 따라 다름; 재현 측정은 docs/performance.md)
 
 4. **CI 친화적이다**
-   - exit code로 판정 (0=safe, 1=destructive, 2=warning)
+   - exit code로 판정 (0=정책상 통과, 1=destructive, 2=warning, 3=실행 오류)
    - JSON/GitHub markdown 출력
    - 한 줄 요약 (grep 가능)
 
@@ -32,13 +32,16 @@ dbt-plan은 `dbt run` 전에 위험을 경고하는 **정적 분석 도구**다.
 ### DO (범위 안)
 - 컴파일 SQL 컬럼 변경 감지
 - materialization × on_schema_change 규칙 기반 위험도 판정
-- 하위 모델 cascade 영향 분석 (broken ref, build failure)
+- 하위 모델 cascade 영향 분석 (broken ref, build failure, SELECT * 상속 컬럼 손실)
+- 하위 unit test 픽스처 컬럼 검사, 하위 exposure 소유자 표시
 - materialization/on_schema_change 설정 변경 감지
+- enforced contract 위반 감지 (컬럼 이름만, data_type 비교는 범위 밖)
 
 ### DO NOT (범위 밖)
 - `dbt run` 시뮬레이션 — 런타임 동작은 범위 밖
 - Warehouse 접속 — 순수 파일 분석만
 - `full_refresh` 모드 판정 — 런타임 플래그는 CI 환경에서 결정
+- Python 모델의 DataFrame 컬럼 분석 — 변경은 별도 REVIEW REQUIRED로 표시
 - `seed`/`source` 변경 감지 — 컴파일 SQL 기반 도구
 - `pre_hook`/`post_hook` DDL 분석 — 복잡성 대비 가치 낮음
 
@@ -70,6 +73,8 @@ make test
 - SELECT \* → ["*"] 반환 (manifest column fallback 지원)
 - Multi-dialect 지원 via --dialect (기본값: snowflake)
 - `enabled: false` 모델은 인덱싱에서 제외
+- `on_schema_change`은 `unrendered_config`에서만 읽는다 — dbt가 모든 모델에 기본값을 채우므로
+  resolved config는 사용자의 주장이 아니다
 
 ## DDL Prediction Rules
 
@@ -79,12 +84,16 @@ make test
 | view | * | CREATE OR REPLACE VIEW | SAFE |
 | ephemeral | * | (no physical object) | SAFE |
 | snapshot | * | REVIEW REQUIRED | WARNING |
-| incremental | ignore | no DDL | SAFE |
+| incremental | ignore | no schema DDL; existing targets may fail on column changes | WARNING on changed/unknown columns |
 | incremental | fail | build failure | WARNING |
 | incremental | append_new_columns | ADD COLUMN only | SAFE |
 | incremental | sync_all_columns | ADD + DROP COLUMN | DESTRUCTIVE if removed |
 | any | (model removed) | MODEL REMOVED | DESTRUCTIVE |
 | any | (unknown osc) | UNKNOWN on_schema_change | WARNING |
+| materialized_view/custom | (사용자가 안 씀) | UNKNOWN materialization | WARNING |
+| any | (contract enforced) | CONTRACT VIOLATION (이름 불일치, 추가/삭제 양쪽) | WARNING |
+| materialized_view / custom | (no osc set) | UNKNOWN materialization | WARNING |
+| materialized_view / custom | (osc set) | follows incremental rules | per osc |
 
 ## Testing
 
@@ -96,3 +105,5 @@ pytest tests/test_columns.py # specific module
 ```
 
 Test fixtures in `tests/fixtures/` contain real-world compiled SQL patterns.
+
+분석 한계와 어댑터·Mesh·seed 경계는 [docs/analysis-limits.md](docs/analysis-limits.md)를 참고한다.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -40,7 +41,7 @@ def _sdist_filenames() -> list[str]:
 
 
 def _read_pyproject() -> str:
-    return (ROOT / "pyproject.toml").read_text()
+    return (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
 
 def _pyproject_version() -> str:
@@ -169,6 +170,22 @@ class TestSdistSurface:
     them. The sdist contents are a deliberate list, not a default.
     """
 
+    @requires_sdist
+    def test_sdist_ships_both_packages(self) -> None:
+        """Checks the built artifact, not the declaration.
+
+        Adding "/src/dbt_plan_mcp" to the include list is not enough on its own:
+        hatchling selects files through the VCS, so a package that exists on disk
+        but is untracked is silently left out. That combination -- declaration
+        present, files absent -- ships an extra whose dependencies install and
+        whose module then cannot be imported.
+        """
+        names = _sdist_filenames()
+        assert "src/dbt_plan/cli.py" in names
+        assert "src/dbt_plan_mcp/server.py" in names, (
+            "the mcp extra would install its dependencies and then import nothing"
+        )
+
     def test_sdist_include_list_is_declared(self) -> None:
         pyproject = _read_pyproject()
         assert "[tool.hatch.build.targets.sdist]" in pyproject, (
@@ -269,6 +286,7 @@ class TestCLIEntryPoint:
             [sys.executable, "-m", "dbt_plan.cli", "--version"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             cwd=str(ROOT),
         )
         # Some CLIs use argparse which may write to stdout
@@ -283,10 +301,42 @@ class TestCLIEntryPoint:
             [sys.executable, "-m", "dbt_plan.cli", "--help"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             cwd=str(ROOT),
         )
         assert result.returncode == 0, f"--help exited with {result.returncode}"
         assert "dbt-plan" in result.stdout.lower() or "dbt_plan" in result.stdout.lower()
+
+    def test_cli_help_flag_uses_utf8_when_stdout_defaults_to_cp1252(self) -> None:
+        """Windows' legacy console encoding must not crash help text containing arrows."""
+        env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+        result = subprocess.run(
+            [sys.executable, "-m", "dbt_plan.cli", "--help"],
+            capture_output=True,
+            env=env,
+            cwd=str(ROOT),
+        )
+        assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+        assert "dbt-plan" in result.stdout.decode("utf-8").lower()
+
+    def test_github_format_output_uses_utf8_when_stdout_defaults_to_cp1252(self) -> None:
+        """Preserve intentional GitHub Markdown icons rather than crashing or flattening them."""
+        code = """
+from dbt_plan.cli import _configure_output_streams
+from dbt_plan.formatter import CheckResult, format_github
+from dbt_plan.predictor import DDLPrediction, Safety
+_configure_output_streams()
+print(format_github(CheckResult([DDLPrediction('orders', 'table', None, Safety.DESTRUCTIVE)])))
+"""
+        env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            env=env,
+            cwd=str(ROOT),
+        )
+        assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+        assert "🔴" in result.stdout.decode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -329,12 +379,12 @@ class TestChangelog:
         assert (ROOT / "CHANGELOG.md").exists(), "CHANGELOG.md missing"
 
     def test_changelog_mentions_current_version(self) -> None:
-        changelog = (ROOT / "CHANGELOG.md").read_text()
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         version = _pyproject_version()
         assert version in changelog, f"CHANGELOG.md does not mention current version {version}"
 
     def test_changelog_has_section_for_current_version(self) -> None:
-        changelog = (ROOT / "CHANGELOG.md").read_text()
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         version = _pyproject_version()
         # Expect a header like ## [0.3.5]
         pattern = rf"## \[{re.escape(version)}\]"
@@ -354,7 +404,7 @@ class TestLicense:
         assert (ROOT / "LICENSE").exists(), "LICENSE file missing"
 
     def test_license_is_apache2(self) -> None:
-        content = (ROOT / "LICENSE").read_text()
+        content = (ROOT / "LICENSE").read_text(encoding="utf-8")
         assert "Apache License" in content
         assert "Version 2.0" in content
 
@@ -379,5 +429,93 @@ class TestBuildSystem:
         assert 'build-backend = "hatchling.build"' in pyproject
 
     def test_wheel_packages_config(self) -> None:
+        """Both packages ship. dbt_plan_mcp is separate on purpose.
+
+        The analysis core promises to be offline and synchronous, and
+        tests/test_invariants.py enforces that by failing on an asyncio or network
+        import anywhere under src/dbt_plan/. An MCP server is both, so it lives in
+        its own package -- which is what keeps the guarantee provable instead of
+        depending on nobody adding the wrong import.
+        """
         pyproject = _read_pyproject()
-        assert 'packages = ["src/dbt_plan"]' in pyproject
+        assert 'packages = ["src/dbt_plan", "src/dbt_plan_mcp"]' in pyproject
+
+
+class TestMcpRegistryManifest:
+    """server.json carries a version by hand, which is exactly how things drift here.
+
+    A stale version publishes a registry entry pointing at a release that is not the
+    current one, so an agent installs an older dbt-plan than the manifest advertises.
+    """
+
+    def test_server_json_version_matches_the_package(self) -> None:
+        import json
+
+        manifest = json.loads((ROOT / "server.json").read_text(encoding="utf-8"))
+        version = _pyproject_version()
+
+        assert manifest["version"] == version
+        assert manifest["packages"][0]["version"] == version
+
+    def test_readme_carries_the_ownership_line(self) -> None:
+        """The registry reads the *PyPI* README to prove the publisher owns the package.
+
+        Without it, publishing fails with:
+
+            PyPI package 'dbt-plan' ownership validation failed. The server name
+            'io.github.PresentJay/dbt-plan' must appear as
+            'mcp-name: io.github.PresentJay/dbt-plan' in the package README
+
+        And because it is checked against PyPI rather than GitHub, removing this line
+        breaks nothing until the next release -- by which point the cause is several
+        commits back.
+        """
+        import json
+
+        manifest = json.loads((ROOT / "server.json").read_text(encoding="utf-8"))
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        assert f"mcp-name: {manifest['name']}" in readme
+
+    def test_namespace_matches_the_github_login_exactly(self) -> None:
+        """The registry namespace is case-sensitive and is not lowercased.
+
+        Reverse-DNS convention suggests lowercase, so the first version of this
+        manifest said `io.github.presentjay/dbt-plan` and publishing returned 403:
+        "You have permission to publish: io.github.PresentJay/*". The registry
+        derives the namespace from the GitHub login as spelled.
+
+        The Pages URL in `websiteUrl` is genuinely lowercase -- github.io hosts are
+        -- so the two differing is correct, not a typo waiting to be tidied.
+        """
+        import json
+
+        manifest = json.loads((ROOT / "server.json").read_text(encoding="utf-8"))
+
+        assert manifest["name"] == "io.github.PresentJay/dbt-plan"
+
+    def test_description_fits_the_registry_limit(self) -> None:
+        """The registry rejects a description over 100 characters with a 422.
+
+        Found by running `mcp-publisher validate` before publishing rather than
+        during it -- the first version of this manifest was 254 characters and
+        would have failed at the point of release.
+        """
+        import json
+
+        manifest = json.loads((ROOT / "server.json").read_text(encoding="utf-8"))
+
+        assert len(manifest["description"]) <= 100, (
+            f"description is {len(manifest['description'])} chars; "
+            "the MCP registry rejects anything over 100"
+        )
+
+    def test_it_points_at_the_pypi_package_this_repo_publishes(self) -> None:
+        import json
+
+        manifest = json.loads((ROOT / "server.json").read_text(encoding="utf-8"))
+        package = manifest["packages"][0]
+
+        assert package["registryType"] == "pypi"
+        assert package["identifier"] == "dbt-plan"
+        assert package["transport"]["type"] == "stdio"

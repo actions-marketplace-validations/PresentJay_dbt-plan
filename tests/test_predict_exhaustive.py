@@ -257,23 +257,23 @@ class TestModifiedNonIncremental:
 
 
 class TestModifiedIncrementalIgnore:
-    def test_ignore_safe_even_with_column_changes(self):
+    def test_ignore_warns_on_column_changes(self):
         pred = _predict(
             on_schema_change="ignore",
             base_columns=["a", "b"],
             current_columns=["a", "c"],
         )
-        assert pred.safety == Safety.SAFE
-        assert "NO DDL" in _op_names(pred)
+        assert pred.safety == Safety.WARNING
+        assert any("BUILD FAILURE" in op for op in _op_names(pred))
 
     def test_none_osc_defaults_to_ignore(self):
-        """on_schema_change=None → 'ignore', stored in result."""
+        """Ignoring schema DDL does not guarantee a successful incremental build."""
         pred = _predict(
             on_schema_change=None,
             base_columns=["a", "b"],
             current_columns=["x"],
         )
-        assert pred.safety == Safety.SAFE
+        assert pred.safety == Safety.WARNING
         assert pred.on_schema_change == "ignore"
 
 
@@ -628,7 +628,7 @@ class TestOscAppendNewColumns:
 
 
 class TestOscSyncAllColumns:
-    """sync_all_columns: ADD + DROP, destructive if removed, reorder detection."""
+    """sync_all_columns: ADD + DROP, destructive if removed, no DDL for reordering."""
 
     def test_identical_columns_safe(self):
         pred = _predict(
@@ -675,15 +675,15 @@ class TestOscSyncAllColumns:
         assert any(op.operation == "ADD COLUMN" for op in pred.operations)
         assert any(op.operation == "DROP COLUMN" for op in pred.operations)
 
-    def test_columns_reordered_warning(self):
-        """Same column set, different order → WARNING + COLUMNS REORDERED."""
+    def test_columns_reordered_safe(self):
+        """Projection order alone does not change dbt's column set or emit DDL."""
         pred = _predict(
             on_schema_change="sync_all_columns",
             base_columns=["a", "b", "c"],
             current_columns=["c", "a", "b"],
         )
-        assert pred.safety == Safety.WARNING
-        assert "COLUMNS REORDERED" in _op_names(pred)
+        assert pred.safety == Safety.SAFE
+        assert pred.operations == []
         # Should NOT have ADD/DROP ops
         assert not any(op.operation in ("ADD COLUMN", "DROP COLUMN") for op in pred.operations)
 
@@ -748,17 +748,20 @@ class TestUnknownOsc:
 
 
 class TestCustomMaterialization:
-    """Any materialization not in {table, view, ephemeral, snapshot} uses incremental path."""
+    """A materialization outside {table, view, ephemeral, snapshot} follows the
+    incremental rules *when on_schema_change is set*, because setting it is an
+    assertion about how that materialization behaves. With nothing set, dbt-plan
+    has no rule to apply and says so rather than assuming "ignore"."""
 
-    def test_custom_mat_ignore_safe(self):
+    def test_custom_mat_ignore_warns(self):
         pred = _predict(
             materialization="custom_materialization",
             on_schema_change="ignore",
             base_columns=["a", "b"],
             current_columns=["a", "c"],
         )
-        assert pred.safety == Safety.SAFE
-        assert "NO DDL" in _op_names(pred)
+        assert pred.safety == Safety.WARNING
+        assert any("BUILD FAILURE" in op for op in _op_names(pred))
 
     def test_custom_mat_fail_with_changes(self):
         pred = _predict(
@@ -790,15 +793,24 @@ class TestCustomMaterialization:
         assert pred.safety == Safety.SAFE
         assert any(op.operation == "ADD COLUMN" for op in pred.operations)
 
-    def test_custom_mat_none_osc_defaults_ignore(self):
+    def test_custom_mat_none_osc_is_not_read_as_ignore(self):
+        """An absent on_schema_change asserts nothing, so it cannot mean "safe".
+
+        This used to assert SAFE with on_schema_change coerced to "ignore" —
+        `a` -> `x` is a dropped column reported clean. Setting the config is a
+        claim by the author about how their materialization behaves, and the
+        tests above still honour it; not setting it is silence, and silence is
+        not a claim. See tests/test_unknown_materialization.py.
+        """
         pred = _predict(
             materialization="custom_materialization",
             on_schema_change=None,
             base_columns=["a"],
             current_columns=["x"],
         )
-        assert pred.safety == Safety.SAFE
-        assert pred.on_schema_change == "ignore"
+        assert pred.safety == Safety.WARNING
+        assert pred.on_schema_change is None
+        assert any("UNKNOWN materialization" in op for op in _op_names(pred))
 
     def test_custom_mat_parse_failure_warning(self):
         pred = _predict(
@@ -992,7 +1004,7 @@ class TestFullIncrementalMatrix:
         [
             ("fail", Safety.SAFE),
             ("append_new_columns", Safety.SAFE),
-            ("sync_all_columns", Safety.WARNING),
+            ("sync_all_columns", Safety.SAFE),
         ],
     )
     def test_reorder_only(self, osc, expected_safety):

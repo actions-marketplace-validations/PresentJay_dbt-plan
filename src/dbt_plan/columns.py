@@ -1,6 +1,7 @@
 """SQLGlot-based column extraction from compiled SQL."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 
 import sqlglot
 from sqlglot import exp
@@ -34,6 +35,41 @@ def _star_is_modified(expr: exp.Expression) -> bool:
     return any(value for value in star.args.values())
 
 
+def _has_sensitive_quoted_columns(tree: exp.Expression, dialect: str) -> bool:
+    """Refuse case-sensitive identifiers until comparisons preserve quote metadata.
+
+    Relation quoting is common in compiled dbt SQL and does not itself change
+    output column identity. DuckDB and BigQuery column names are case-insensitive.
+    Other dialects are conservatively refused rather than folded incorrectly.
+    """
+    if dialect in {"duckdb", "bigquery"}:
+        return False
+    for node in tree.walk():
+        identifier = None
+        if isinstance(node, exp.Column):
+            identifier = node.this
+        elif isinstance(node, exp.Alias):
+            identifier = node.args.get("alias")
+        elif isinstance(node, exp.TableAlias):
+            if any(col.args.get("quoted") for col in node.args.get("columns") or []):
+                return True
+        if isinstance(identifier, exp.Identifier) and identifier.args.get("quoted"):
+            return True
+    return False
+
+
+def _exclude_star_columns(
+    expr: exp.Expression, columns: list[tuple[str, str | None]]
+) -> list[tuple[str, str | None]] | None:
+    star = expr.this if isinstance(expr, exp.Column) else expr
+    if any(value for key, value in star.args.items() if key != "except_"):
+        return None
+    excluded = {col.output_name.lower() for col in star.args.get("except_") or []}
+    if not excluded.issubset({name for name, _ in columns}):
+        return None  # Invalid/ambiguous exclusion must not look like a valid schema.
+    return [(name, cast) for name, cast in columns if name not in excluded]
+
+
 def _sole_source(select: exp.Select) -> exp.Table | None:
     """The only FROM source, or None when there is not exactly one.
 
@@ -50,6 +86,13 @@ def _sole_source(select: exp.Select) -> exp.Table | None:
     if not isinstance(source, exp.Table):
         return None  # subquery, table function, UNNEST -- not a resolvable name
     return source
+
+
+def _output_select(tree: exp.Expression) -> exp.Select | None:
+    """Read set-operation names from the left branch, including parentheses."""
+    while isinstance(tree, exp.Subquery | exp.SetOperation):
+        tree = tree.this
+    return tree if isinstance(tree, exp.Select) else None
 
 
 def _relation_key(table: exp.Table) -> str:
@@ -102,6 +145,11 @@ def _resolve_star_columns(
     if len(seen) > _MAX_CTE_DEPTH:
         return None
 
+    # PIVOT/UNPIVOT transform a source schema. Never resolve its input star as
+    # the transformed output, including qualified stars referencing a CTE.
+    if any(table.args.get("pivots") for table in select.find_all(exp.Table)):
+        return None
+
     columns: list[tuple[str, str | None]] = []
     for expr in select.expressions:
         if not _is_star(expr):
@@ -111,25 +159,38 @@ def _resolve_star_columns(
             columns.append((name.lower(), _projection_cast(expr, dialect)))
             continue
 
-        if _star_is_modified(expr):
-            return None  # EXCEPT / EXCLUDE / REPLACE / RENAME -- not a plain star
-
-        # A qualified `t.*` names its own source, so it is safe beside a join --
-        # but mapping that alias back to a physical table is not attempted, so it
-        # only resolves against a CTE.
+        # Resolve the named source in this SELECT scope before consulting CTEs:
+        # a qualified physical relation must not be shadowed by a CTE name.
         if isinstance(expr, exp.Column) and expr.table:
-            source, table = expr.table, None
+            frm = select.args.get("from_") or select.args.get("from")
+            sources = ([frm.this] if frm else []) + [
+                join.this for join in select.args.get("joins") or []
+            ]
+            matches = [
+                t for t in sources if isinstance(t, exp.Table) and t.alias_or_name == expr.table
+            ]
+            if len(matches) != 1:
+                return None
+            table = matches[0]
         else:
             table = _sole_source(select)
             if table is None:
                 return None
-            source = table.alias_or_name
+        # An alias identifies this source in the SELECT, not a different CTE.
+        # Both star forms must resolve CTE identity from the relation name.
+        source = table.name
+        if table.alias_column_names:
+            # FROM source AS alias(new_names) changes the output schema.
+            return None
 
         if source in seen:
             return None
 
-        body = ctes.get(source)
+        body = ctes.get(source) if table is None or not (table.db or table.catalog) else None
         if body is not None:
+            if isinstance(body.parent, exp.CTE) and body.parent.alias_column_names:
+                # WITH source(new_names) AS (...) also renames the body output.
+                return None
             if not isinstance(body, exp.Select):
                 # A set operation or recursive CTE, whose column list is not a
                 # straight read of one SELECT's projections.
@@ -140,7 +201,10 @@ def _resolve_star_columns(
             inner = _resolve_star_columns(body, ctes, seen | {source}, dialect, table_columns)
             if not inner:
                 return None
-            columns.extend(inner)
+            expanded = _exclude_star_columns(expr, inner)
+            if expanded is None:
+                return None
+            columns.extend(expanded)
             continue
 
         # Not a CTE: it is a physical relation, which for a dbt project is
@@ -152,9 +216,74 @@ def _resolve_star_columns(
             return None
         # Casts are not carried across a model boundary; that model is checked
         # on its own, where its casts are visible.
-        columns.extend((name.lower(), None) for name in found)
+        expanded = _exclude_star_columns(expr, [(name.lower(), None) for name in found])
+        if expanded is None:
+            return None
+        columns.extend(expanded)
 
     return columns or None
+
+
+@dataclass(frozen=True)
+class ColumnExtraction:
+    """Known output names plus an explicit refusal for any remaining projection."""
+
+    columns: list[str]
+    has_unknown: bool = False
+
+
+def extract_column_details(
+    sql: str,
+    *,
+    dialect: str = "snowflake",
+    table_columns: Callable[[str], list[str] | None] | None = None,
+) -> ColumnExtraction:
+    """Retain readable names without inventing warehouse-generated expression names.
+
+    Consumers must propagate ``has_unknown`` as a review warning, even when the
+    known names suffice to detect a removed column. A bare unresolved star keeps
+    the legacy sentinel for callers that have manifest fallback information.
+    """
+    try:
+        tree = sqlglot.parse_one(sql.lstrip("\ufeff"), dialect=dialect)
+    except (sqlglot.errors.ParseError, sqlglot.errors.TokenError, ValueError, RecursionError):
+        return ColumnExtraction([], True)
+    select = _output_select(tree)
+    if select is None or _has_sensitive_quoted_columns(tree, dialect):
+        return ColumnExtraction([], True)
+    ctes = _cte_bodies(tree)
+    if (ctes or table_columns) and any(_is_star(e) for e in select.expressions):
+        resolved = _resolve_star_columns(select, ctes, frozenset(), dialect, table_columns)
+        if resolved:
+            return ColumnExtraction([name for name, _ in resolved])
+    names = []
+    # A failed CTE expansion must not disguise its unknown projections or star
+    # modifiers as a plain star eligible for manifest fallback.
+    unknown = (
+        any(
+            _star_is_modified(expr) if _is_star(expr) else not (expr.alias or expr.output_name)
+            for scope in tree.find_all(exp.Select)
+            for expr in scope.expressions
+        )
+        if any(_is_star(e) for e in select.expressions)
+        else False
+    )
+    plain_star = False
+    for expr in select.expressions:
+        if _is_star(expr):
+            if _star_is_modified(expr):
+                unknown = True
+                continue
+            plain_star = True
+            continue
+        name = expr.alias or expr.output_name
+        if name:
+            names.append(name.lower())
+        else:
+            unknown = True
+    if plain_star and not unknown:
+        return ColumnExtraction(["*"])
+    return ColumnExtraction(names, unknown or not names)
 
 
 def extract_columns(
@@ -163,71 +292,13 @@ def extract_columns(
     dialect: str = "snowflake",
     table_columns: Callable[[str], list[str] | None] | None = None,
 ) -> list[str] | None:
-    """Extract column names from compiled SQL's final SELECT.
+    """Extract lowercased names, ["*"] for a plain star, or None if uncertain.
 
-    Parses with the given SQL dialect. Returns lowercased column names
-    using alias if available, otherwise output_name.
-
-    Args:
-        sql: Compiled SQL string.
-        dialect: sqlglot dialect name (default: "snowflake").
-
-    Returns:
-        list[str]: Column names (lowercased).
-        ["*"]: If final SELECT uses SELECT *.
-        None: If parsing fails or no SELECT found.
+    Use ``extract_column_details`` to retain known names from a partly readable
+    projection while keeping its required review warning.
     """
-    # Strip BOM (U+FEFF) that some editors/tools prepend to UTF-8 files
-    sql = sql.lstrip("\ufeff")
-
-    try:
-        tree = sqlglot.parse_one(sql, dialect=dialect)
-    except (sqlglot.errors.ParseError, sqlglot.errors.TokenError, ValueError, RecursionError):
-        # ParseError: malformed SQL; TokenError: untokenizable input (unclosed quotes, binary);
-        # ValueError: unknown dialect; RecursionError: deeply nested SQL exceeds stack
-        return None
-
-    select = tree.find(exp.Select)
-    if select is None:
-        return None
-
-    # The canonical dbt staging model ends in `select * from renamed`, where
-    # `renamed` is a CTE listing its columns explicitly. Every name is in the
-    # file. Try to read them before giving up; _resolve_star_columns refuses
-    # rather than guessing, so a refusal leaves the behaviour below untouched.
-    ctes = _cte_bodies(tree)
-    if (ctes or table_columns) and any(_is_star(e) for e in select.expressions):
-        resolved = _resolve_star_columns(select, ctes, frozenset(), dialect, table_columns)
-        if resolved:
-            return [name for name, _ in resolved]
-
-    columns = []
-    expr_count = 0
-    for expr in select.expressions:
-        expr_count += 1
-        if isinstance(expr, exp.Star):
-            # BigQuery SELECT * EXCEPT(col1, col2) — extract excluded columns
-            except_cols = expr.args.get("except_")
-            if except_cols:
-                excluded = sorted(
-                    col.output_name.lower() for col in except_cols if col.output_name
-                )
-                if excluded:
-                    return [f"* except({', '.join(excluded)})"]
-            return ["*"]
-        name = expr.alias or expr.output_name
-        # Qualified star (e.g. t1.*) produces a Column with name='*'
-        if name == "*":
-            return ["*"]
-        if name:
-            columns.append(name.lower())
-
-    # If some expressions had no extractable name (e.g. CASE without AS),
-    # we have ambiguity — return None so the caller treats as REVIEW REQUIRED
-    if columns and len(columns) < expr_count:
-        return None
-
-    return columns if columns else None
+    result = extract_column_details(sql, dialect=dialect, table_columns=table_columns)
+    return None if result.has_unknown else result.columns
 
 
 def extract_cast_types(
@@ -255,8 +326,8 @@ def extract_cast_types(
     except (sqlglot.errors.ParseError, sqlglot.errors.TokenError, ValueError, RecursionError):
         return None
 
-    select = tree.find(exp.Select)
-    if select is None:
+    select = _output_select(tree)
+    if select is None or _has_sensitive_quoted_columns(tree, dialect):
         return None
 
     resolved = _resolve_star_columns(
@@ -265,3 +336,118 @@ def extract_cast_types(
     if resolved is None:
         return None
     return {name: cast for name, cast in resolved if cast}
+
+
+def columns_read_by_relation(
+    sql: str,
+    schema: dict[str, dict[str, str]],
+    *,
+    dialect: str = "snowflake",
+) -> dict[str, list[str]] | None:
+    """Every relation this SQL names columns from, and which columns -- in one parse.
+
+    Cascade detection was textual -- look for the dropped column's name anywhere in
+    the downstream SQL -- which fires on a comment, a string literal, and any column
+    of the same name belonging to a different table:
+
+        SELECT c.customer_id
+        FROM stg_orders o JOIN dim_customers c ON o.order_id = c.order_id
+
+    Nothing there reads `stg_orders.customer_id`, and the text search says it does.
+    Resolving the reference instead needs a schema, and dbt-plan has one: every
+    model's columns, worked out from the project's own compiled SQL. `schema` is
+    keyed by bare relation name, which sqlglot matches against the fully qualified
+    relation that compiled dbt SQL actually contains.
+
+    One parse per downstream model, answering for every relation it touches. The
+    cascade asks about each model that is losing a column -- in a `SELECT *` chain
+    that is every model upstream -- and re-qualifying the same SQL once per question
+    put a 200-model project at 38 seconds against a 5 second budget.
+
+    Named explicitly, and stars deliberately left out. This exists to decide whether
+    a query will *fail*, and `select *` never fails when a column disappears -- it
+    returns one column fewer. That is a different finding, and predict_ddl already
+    makes it for the model that inherits the loss.
+
+    Keys are the relation names as written in the SQL, lowercased. Returns None when
+    the answer would be a guess: the SQL will not parse, or a column cannot be
+    attributed to a relation. The caller falls back to searching the text, which is
+    wider -- a refusal here must never narrow what gets reported.
+    """
+    from sqlglot.errors import OptimizeError, SqlglotError
+    from sqlglot.optimizer.qualify import qualify
+
+    sql = sql.lstrip("\ufeff")
+    try:
+        tree = qualify(
+            sqlglot.parse_one(sql, dialect=dialect),
+            schema=schema,
+            dialect=dialect,
+            expand_stars=False,
+        )
+    except (SqlglotError, OptimizeError, ValueError, KeyError, RecursionError):
+        return None
+
+    alias_to_relation = {
+        table.alias_or_name: table.name.lower() for table in tree.find_all(exp.Table)
+    }
+    read: dict[str, set[str]] = {name: set() for name in alias_to_relation.values()}
+    for column in tree.find_all(exp.Column):
+        relation = alias_to_relation.get(column.table)
+        if relation is not None and not isinstance(column.this, exp.Star):
+            read[relation].add(column.name.lower())
+    return {relation: sorted(columns) for relation, columns in read.items()}
+
+
+def columns_read_from(
+    sql: str,
+    relation: str | Iterable[str],
+    schema: dict[str, dict[str, str]],
+    *,
+    dialect: str = "snowflake",
+) -> list[str] | None:
+    """Which columns this SQL names explicitly from `relation`.
+
+    `relation` is every name the model is known by -- its own, and the relation an
+    `alias:` config makes it write to. Compiled SQL only ever contains the latter,
+    so matching on the model name alone answers "does not read it" for a model that
+    reads nothing else. See columns_read_by_relation for the rest.
+    """
+    by_relation = columns_read_by_relation(sql, schema, dialect=dialect)
+    if by_relation is None:
+        return None
+    names = {relation.lower()} if isinstance(relation, str) else {r.lower() for r in relation}
+    return sorted({col for name in names for col in by_relation.get(name, [])})
+
+
+# Coarse on purpose. sqlglot parses `varchar` and `text` to different types, and on
+# Snowflake or duckdb they are the same one -- comparing more finely than this means
+# a per-adapter table, and a wrong answer about a type is worse than no answer.
+# Measured against dbt 1.11.7: a contract declaring `varchar` accepts a `TEXT` cast
+# and rejects an `INTEGER` one. These families are the line no adapter disagrees with.
+_TYPE_FAMILIES = (
+    ("text", "TEXT_TYPES"),
+    ("number", "NUMERIC_TYPES"),
+    ("date/time", "TEMPORAL_TYPES"),
+)
+
+
+def type_family(declared: str, *, dialect: str = "snowflake") -> str | None:
+    """The broad family a declared SQL type belongs to, or None if it has no obvious one.
+
+    `varchar`, `text` and `string` are all "text". `int`, `bigint` and `numeric` are
+    all "number", so a widening within a family is deliberately not reported -- see
+    the module comment above for why that line is where it is.
+    """
+    try:
+        parsed = sqlglot.parse_one(declared, into=exp.DataType, read=dialect)
+    except (sqlglot.errors.ParseError, sqlglot.errors.TokenError, ValueError, RecursionError):
+        return None
+
+    kind = parsed.this
+    if kind == exp.DataType.Type.BOOLEAN:
+        return "boolean"
+    for name, attribute in _TYPE_FAMILIES:
+        if kind in getattr(exp.DataType, attribute):
+            return name
+    return None

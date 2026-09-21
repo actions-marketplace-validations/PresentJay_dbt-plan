@@ -21,9 +21,14 @@ inputs:
   project-dir:
     description: dbt project directory.
     default: .
+  target-dir:
+    description: dbt target directory, relative to project-dir.
+    default: target
   dialect:
-    description: sqlglot dialect used to parse compiled SQL.
-    default: snowflake
+    description: >-
+      Optional sqlglot dialect override. Empty preserves CLI configuration and manifest
+      adapter detection, with snowflake as the fallback.
+    default: ''
   version:
     description: dbt-plan version to install. Empty installs the latest release.
     default: ''
@@ -31,6 +36,7 @@ inputs:
     description: >-
       Which verdict fails the job: destructive, warning, or never. "warning" honours
       warning_exit_code from .dbt-plan.yml, so setting that to 0 opts out of it.
+      Execution errors always fail, including when fail-on is never.
     default: destructive
   summary:
     description: Write the report to the job step summary.
@@ -41,7 +47,7 @@ outputs:
     description: safe, destructive, or warning.
     value: ${{ steps.check.outputs.verdict }}
   exit-code:
-    description: The dbt-plan exit code -- 0 safe, 1 destructive, 2 warning.
+    description: The dbt-plan exit code -- 0 safe, 1 destructive, 2 warning, 3 execution error (no verdict).
     value: ${{ steps.check.outputs.exit-code }}
   report:
     description: Path to the JSON report.
@@ -71,6 +77,7 @@ runs:
       env:
         BASE_REF: ${{ inputs.base-ref }}
         COMPILE: ${{ inputs.compile-command }}
+        TARGET_DIR: ${{ inputs.target-dir }}
       run: |
         set -eu
         if [ -z "$BASE_REF" ]; then
@@ -84,7 +91,7 @@ runs:
         git rev-parse HEAD > "$RUNNER_TEMP/dbt-plan-head"
         git checkout --detach --quiet "$BASE_REF"
         eval "$COMPILE"
-        dbt-plan snapshot
+        dbt-plan snapshot --target-dir "$TARGET_DIR"
 
     - name: Compile current
       shell: bash
@@ -103,21 +110,32 @@ runs:
       env:
         DIALECT: ${{ inputs.dialect }}
         SUMMARY: ${{ inputs.summary }}
+        TARGET_DIR: ${{ inputs.target-dir }}
       run: |
         set -u
+        set --
+        if [ -n "$DIALECT" ]; then
+          set -- --dialect "$DIALECT"
+        fi
         report="$RUNNER_TEMP/dbt-plan-report.json"
-        dbt-plan check --dialect "$DIALECT" --format json > "$report"
-        code=$?
+        code=0
+        dbt-plan check --target-dir "$TARGET_DIR" "$@" --format json > "$report" || code=$?
         case "$code" in
           0) verdict=safe ;;
           1) verdict=destructive ;;
           2) verdict=warning ;;
           *) echo "::error::dbt-plan exited $code"; cat "$report"; exit "$code" ;;
         esac
-        if [ "$SUMMARY" = "true" ]; then
-          dbt-plan check --dialect "$DIALECT" --format github >> "$GITHUB_STEP_SUMMARY" || true
+        # Older package versions use verdict codes for errors too. Require a
+        # report before applying policy, including when version pins 0.15.x.
+        if ! python -c 'import json, sys; data = json.load(open(sys.argv[1], encoding="utf-8")); sys.exit(not (isinstance(data, dict) and isinstance(data.get("summary"), dict) and isinstance(data.get("models"), list)))' "$report" 2>/dev/null; then
+          echo "::error::dbt-plan did not produce a completed JSON report (exit $code)"
+          exit 3
         fi
-        dbt-plan check --dialect "$DIALECT" --no-color || true
+        if [ "$SUMMARY" = "true" ]; then
+          dbt-plan check --target-dir "$TARGET_DIR" "$@" --format github >> "$GITHUB_STEP_SUMMARY" || true
+        fi
+        dbt-plan check --target-dir "$TARGET_DIR" "$@" --no-color || true
         {
           echo "verdict=$verdict"
           echo "exit-code=$code"

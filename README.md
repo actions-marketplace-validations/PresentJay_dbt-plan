@@ -1,27 +1,45 @@
 # dbt-plan
 
+[![CI](https://github.com/PresentJay/dbt-plan/actions/workflows/ci.yml/badge.svg)](https://github.com/PresentJay/dbt-plan/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/dbt-plan.svg)](https://pypi.org/project/dbt-plan/)
+
 Static analysis tool that warns about risky DDL changes before `dbt run`.
 
-Like `terraform plan` for dbt. Runs on compiled SQL — you need a `dbt compile` (which connects), but from there dbt-plan works on files alone. Works with any warehouse (Snowflake, BigQuery, Redshift, Postgres, etc.).
+Like `terraform plan` for dbt, and used the same way: you run it **before** the thing
+that changes your warehouse, not only in CI afterwards.
+
+Analyzes compiled SQL files from warehouses including Snowflake, BigQuery,
+Redshift, Postgres and DuckDB through one code path. SQL dialect support varies;
+see [analysis limits](docs/analysis-limits.md).
 
 ## What It Looks Like
 
 ```
 $ dbt-plan check
 
-dbt-plan -- 2 model(s) changed
+dbt-plan -- 4 model(s) changed
+  dialect: snowflake (default; adapter: unknown)
+  baseline: unknown revision, unknown snapshot time
+
 
 DESTRUCTIVE  int_order_enriched (incremental, sync_all_columns)
-  DROP COLUMN  shipping_info
+  ADD COLUMN  billing_method
+  ADD COLUMN  shipping_city
   DROP COLUMN  billing_info
-  ADD COLUMN   shipping_city
-  Downstream: dim_customers, fct_orders (2 model(s))
-  >> BROKEN_REF  fct_orders: references dropped column(s): shipping_info
+  DROP COLUMN  shipping_info
+  Downstream: dim_customers, fct_daily_sales (2 model(s))
+  >> BROKEN_REF  fct_daily_sales: reads dropped column(s): shipping_info
 
 SAFE  dim_customers (table)
   CREATE OR REPLACE TABLE
 
-dbt-plan: 2 checked, 1 safe, 0 warning, 1 destructive, 1 cascade risk(s)
+SAFE  dim_publishers (table)
+  CREATE OR REPLACE TABLE
+
+SAFE  fct_daily_sales (incremental, append_new_columns)
+  ADD COLUMN  total_sales
+
+dbt-plan: 4 checked, 3 safe, 0 warning, 1 destructive, 1 cascade risk(s)
 ```
 
 ## What It Does
@@ -30,23 +48,103 @@ dbt-plan analyzes compiled SQL diffs to catch dangerous schema changes at PR tim
 
 - **Column changes**: detects ADD/DROP COLUMN from SQL diff
 - **Risk assessment**: judges safety based on materialization x on_schema_change rules
-- **Cascade analysis**: finds downstream models that reference dropped columns
+- **Cascade analysis**: finds downstream models broken by a dropped column — the ones that
+  name it, resolved against the project's own schema rather than matched as text; the ones
+  that select `*` and lose it without their own file changing; and the tests whose fixtures
+  pin it down. Names the exposures whose owners need telling
+- **Contracts**: reports a change an enforced contract will reject, in either direction
 - **Config changes**: detects materialization or on_schema_change policy changes
 - **Type changes**: compares explicit `CAST` types between revisions
 - **`SELECT *` resolution**: reads the columns from the CTEs of the same statement, and follows a `ref()` into the referenced model's compiled SQL
 
-It does NOT execute anything, connect to any warehouse, or simulate `dbt run`. It reads files, compares them, and warns you.
+The analysis reads files, compares them, and warns; it does not connect to a warehouse or simulate `dbt run`. The optional `dbt-plan run` workflow invokes your compile command, which can require credentials and execute macros.
 
 ## Quick Start
 
-```bash
-pip install dbt-plan
+### See a result without a warehouse
 
-# In your dbt project directory:
-dbt-plan run               # One command: compile baseline → compile current → check
+The repository includes before/after compiled SQL and a manifest, so you can try the
+analysis without installing dbt or configuring warehouse credentials:
+
+```bash
+git clone --depth 1 https://github.com/PresentJay/dbt-plan
+cd dbt-plan
+python -m pip install dbt-plan
+bash examples/sample-project/run-example.sh
 ```
 
-That's it. `dbt-plan run` handles `dbt compile`, snapshotting, and checking automatically — so it needs whatever credentials your `dbt compile` normally needs. If you can't compile locally, run it in CI (see below) and dbt-plan reads the artifacts there.
+The sample prints text, GitHub markdown and JSON output. It intentionally contains a
+dropped column, so the inner check reports exit code `1` (`destructive`); the example
+script itself completes successfully. See the [sample scenario](docs/use-cases.md) for
+the expected finding.
+
+### Use it with your dbt project
+
+```bash
+python -m pip install dbt-plan
+dbt-plan run               # compile baseline → compile current → check
+```
+
+`dbt-plan run` does the whole thing in one command and needs whatever credentials your
+`dbt compile` normally needs. If your project already has compiled artifacts, use
+`dbt-plan check` directly; it only reads local files and does not connect to a warehouse.
+
+### The loop it is built for
+
+Once you have a baseline, the inner loop is a single sub-second command. Edit a model or a
+macro, recompile, and see what `dbt run` would do — *before* running it:
+
+```bash
+dbt-plan snapshot          # once, on the revision you are changing from
+                           # ... edit models, edit macros ...
+dbt compile && dbt-plan check
+```
+
+`dbt-plan check` reads local compiled artifacts. Its latency is separate from
+`dbt compile`, which can depend on your adapter, macros, and warehouse.
+See the [reproducible CLI benchmark](docs/performance.md) for measured workloads,
+raw samples, and commands to measure your machine.
+
+### Working with a coding agent
+
+An agent editing models cannot eyeball a diff and hesitate. Give it the check and the
+reasons behind it:
+
+```bash
+dbt-plan agent-setup       # writes dbt-plan guidance into your AGENTS.md
+dbt-plan check --format json
+```
+
+The guidance leads with what an agent most often gets wrong: adding a model to
+`ignore_models`, or downgrading `on_schema_change` from `sync_all_columns` to `ignore`,
+silences a real finding without making the change safe.
+
+Or give it the check as an MCP tool:
+
+```bash
+pip install 'dbt-plan[mcp]'
+dbt-plan-mcp                # stdio MCP server exposing `plan` and `snapshot`
+```
+
+`plan` returns the verdict, the per-model operations, and — separately — a `refusals`
+list naming everything dbt-plan declined to judge. That separation is the point: a person
+reading "safe" may still glance at the diff, an agent reading it proceeds, so a
+non-empty `refusals` must never be collapsed into the verdict.
+
+Both tools accept `target_dir` when dbt writes artifacts outside the default `target/`,
+for example `plan(project_dir=".", target_dir="build")`.
+
+The server is a separate package from the analysis core. The core is offline and
+synchronous by design and `tests/test_invariants.py` fails the build on an `asyncio` or
+network import anywhere inside it; an MCP server is both, so keeping them apart is what
+keeps that guarantee provable.
+
+Registry entry — the line below is how the MCP registry verifies that whoever publishes
+the entry also owns this PyPI package, so it has to stay in the README that ships:
+
+```
+mcp-name: io.github.PresentJay/dbt-plan
+```
 
 ### More commands
 
@@ -54,13 +152,18 @@ That's it. `dbt-plan run` handles `dbt compile`, snapshotting, and checking auto
 dbt-plan init              # Generate .dbt-plan.yml config + update .gitignore
 dbt-plan stats             # Analyze project readiness
 dbt-plan ci-setup          # Generate GitHub Actions workflow
-dbt-plan agent-setup       # Write AGENTS.md so coding agents know to run the check
 dbt-plan check --format github   # GitHub markdown output
 dbt-plan check --format json     # JSON for CI pipelines
-dbt-plan check --select model1   # Check specific model only
+dbt-plan run --against main           # compare with where this branch left main
+dbt-plan check --select fct_orders    # one model
+dbt-plan check --select fct_orders+   # it and everything downstream
 ```
 
 
+`--select` accepts model names and optional upstream/downstream `+` operators;
+comma-separated terms form a union. In the next minor release, unsupported or
+unknown selections fail with exit 3. Use explicit version names such as
+`fct_orders_v2`. See the [selection contract and examples](docs/selection.md).
 
 ## Scope
 
@@ -70,8 +173,10 @@ dbt-plan is a **static analysis warning tool**, not a runtime simulator.
 |----------|-------------|
 | Column ADD/DROP detection from compiled SQL | `dbt run` simulation |
 | materialization × on_schema_change risk rules | Warehouse connection |
-| Cascade broken ref / build failure analysis | `seed` / `source` change detection |
+| Cascade: broken refs, build failures, inherited column loss | `seed` / `source` change detection |
 | Config change detection (materialization, osc) | `pre_hook` / `post_hook` DDL analysis |
+| Unit test fixtures and exposure owners downstream | `seed` / `source` fixtures dbt-plan cannot read |
+| Enforced-contract violations: names, and types by family | Contract types compared more finely than family |
 | Explicit `CAST` type changes | Type changes on uncast columns |
 | `SELECT *` resolved through CTEs and `ref()` | `SELECT *` over a source or a raw table |
 | CI exit codes + structured output | `full_refresh` mode judgment |
@@ -82,7 +187,8 @@ dbt-plan is a **static analysis warning tool**, not a runtime simulator.
 
 dbt-plan answers a narrower question than the warehouse-connected tools (Recce,
 SQLMesh, data-diff) and costs nothing to run, so it works as the cheap gate in
-front of them — including on fork pull requests, where they cannot run at all.
+front of them — and on the Fusion engine, which compiles without a warehouse
+connection, that includes fork pull requests where they cannot run at all.
 See [use cases](docs/use-cases.md) for the comparison, real timings, and what it
 gets wrong.
 
@@ -92,7 +198,7 @@ Ideas that look useful but contradict what this tool is:
 
 | Idea | Why not |
 |------|---------|
-| INFORMATION_SCHEMA query | Requires a warehouse connection. dbt-plan reads files and nothing else — that is what makes it safe to run anywhere, including on a fork's PR. |
+| INFORMATION_SCHEMA query | Requires a warehouse connection. dbt-plan reads files and nothing else, which is what lets it run wherever its input exists — including a fork's pull request, once the project compiles on Fusion. |
 | Type changes on columns with no explicit `CAST` | The type is whatever the warehouse assigned, so seeing a change would mean asking it. Columns that *are* cast explicitly on both sides are compared — see below. |
 
 ## DDL Prediction Rules
@@ -103,12 +209,30 @@ Ideas that look useful but contradict what this tool is:
 | view | any | `CREATE OR REPLACE VIEW` | SAFE |
 | ephemeral | any | (no physical object) | SAFE |
 | snapshot | any | `REVIEW REQUIRED` | WARNING |
-| incremental | ignore | no DDL | SAFE |
+| incremental | ignore | no schema DDL; existing targets may fail on column changes | WARNING on changed/unknown columns |
 | incremental | fail | build failure | WARNING |
 | incremental | append_new_columns | `ADD COLUMN` only | SAFE |
 | incremental | sync_all_columns | `ADD + DROP COLUMN` | DESTRUCTIVE if columns removed |
 | any | (model removed) | `MODEL REMOVED` | DESTRUCTIVE |
 | any | (unknown osc) | `UNKNOWN on_schema_change` | WARNING |
+| materialized_view / custom | (not set by you) | `UNKNOWN materialization` | WARNING |
+| materialized_view / custom | (you set one) | follows the incremental rules | per osc |
+| any | (`contract: {enforced: true}`) | `CONTRACT VIOLATION` | WARNING |
+
+Under a contract, a column's declared `data_type` is compared with its explicit `CAST`,
+by family -- text against number against date/time against boolean. `varchar` and `text`
+are the same family and not a finding; `varchar` and `integer` are a build failure.
+Comparing more finely means a per-adapter type table, and a wrong answer about a type is
+worse than no answer.
+
+"Not set by you" means the author wrote no `on_schema_change`, in the model or in
+`dbt_project.yml`. dbt resolves one for every model regardless, so the resolved value
+asserts nothing; an explicit setting is a claim about how that materialization behaves
+and is honoured. dbt-plan reads `unrendered_config` to tell them apart.
+
+An enforced contract inverts the rules above: dbt requires every column to be declared,
+so a column added to the SQL fails the build just as a removed one does. Names only —
+dbt compares its declared `data_type` against the warehouse, which dbt-plan does not read.
 
 ## CI Integration (GitHub Actions)
 
@@ -116,7 +240,6 @@ Ideas that look useful but contradict what this tool is:
 name: dbt-plan
 on:
   pull_request:
-    paths: ['models/**', 'macros/**', 'dbt_project.yml']
 
 jobs:
   plan:
@@ -125,6 +248,7 @@ jobs:
       contents: read
     env:
       # Whatever your profiles.yml reads. `dbt compile` connects; dbt-plan does not.
+      UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/project-venv
       SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
       SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
       SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
@@ -135,10 +259,18 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
-      - run: pip install uv && uv sync
+      - run: pip install uv
+      - run: uv sync --locked
 
       - uses: PresentJay/dbt-plan@v1
+        with:
+          compile-command: uv run --no-sync dbt compile
 ```
+
+This example assumes a checked-in `uv.lock` with your dbt adapter included. The
+virtual environment lives outside the checkout so changing revisions cannot replace
+it. With pip/requirements.txt, install your adapter before the Action and use the
+default `dbt compile` command. Run `dbt deps` first if your project uses dbt packages.
 
 Keep the `pull_request` trigger. Never switch it to `pull_request_target` — `dbt compile`
 runs Jinja and macros written in the pull request, so that would hand your warehouse
@@ -149,7 +281,8 @@ credentials to code from any fork.
 | `compile-command` | `dbt compile` | Runs twice, once per revision. |
 | `base-ref` | the PR base | The revision to compare against. |
 | `project-dir` | `.` | dbt project directory. |
-| `dialect` | `snowflake` | sqlglot dialect for parsing compiled SQL. |
+| `target-dir` | `target` | dbt artifact directory relative to `project-dir`; set this when dbt writes to a custom path such as `build`. |
+| `dialect` | empty | Preserve CLI configuration and manifest adapter detection, then fall back to `snowflake`. Set only to override the project. |
 | `version` | latest | Pin a dbt-plan release. |
 | `fail-on` | `destructive` | Or `warning`, or `never`. |
 | `summary` | `true` | Write the report to the job step summary. |
@@ -158,8 +291,28 @@ Outputs `verdict` (`safe` / `destructive` / `warning`), `exit-code`, and `report
 (path to the JSON report), so a later step can comment on the PR or open a ticket.
 
 For a workflow you own outright rather than a wrapped action, `dbt-plan ci-setup`
-generates one with the credential wiring and least-privilege notes inline. Details in
-[docs/ci-integration.md](docs/ci-integration.md).
+generates one with credential wiring and least-privilege notes inline. The next-minor
+generator supports `pyproject.toml`/`uv.lock` and `requirements.txt`, installs dbt and
+dbt-plan in one environment, and separates summary rendering from its gate. The default
+`FAIL_ON: destructive` allows warnings but always blocks execution errors. Regenerate
+existing workflows to adopt it; see [docs/ci-integration.md](docs/ci-integration.md).
+
+## Exit codes
+
+The next minor release separates execution failures from review findings (a breaking
+change from 0.15.x). This contract is implemented on main and is not yet released.
+
+| Code | Meaning |
+|---|---|
+| `0` | No blocking findings under the configured policy. |
+| `1` | Destructive findings. |
+| `2` | Review required: SQL uncertainty or potential build/test failures. |
+| `3` | Execution failed: invalid input, missing artifacts, compile/recovery failure, or an internal error. No completed verdict. |
+
+`warning_exit_code` still controls review findings; its default remains `2`.
+Setting it to `0` does not suppress execution errors. Code `3` is reserved and cannot
+be used for warnings. The Action fails on execution errors even with `fail-on: never`.
+See [the migration guide](docs/exit-codes.md) before upgrading a CI script or pinned Action.
 
 ## How It Works
 
@@ -189,6 +342,18 @@ flowchart TD
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, TDD workflow, and coding rules.
 
+**First contribution?** [Choose a small, ready task](docs/first-contribution.md):
+SQL fixtures, documentation or a sample-script fix, with exact expected results
+and no warehouse credentials required.
+
+**CI feedback for contributors:** PRs to this repository get one automatically
+updated status comment with the tested commit, approval waits, and links to failed
+jobs. Comment `/ci` to refresh it, or `/ci retry` to retry a transient failure.
+External contributions still need a maintainer's execution approval; retrying does
+not bypass it. See [commands and limits](CONTRIBUTING.md#checking-ci-on-your-pull-request).
+This helper is for contributions to dbt-plan itself, separate from the GitHub Action
+you install in your own dbt project.
+
 ### Architecture
 
 ```
@@ -204,23 +369,25 @@ src/dbt_plan/
 
 ### How to Contribute
 
-**Good first issues:**
-- Add compiled SQL fixtures in `tests/fixtures/` for edge cases (UNION, subqueries, etc.)
-- Improve error messages for common mistakes
-
-**Medium issues:**
-- `ddl-reviewed` label override — escape hatch for intentional destructive changes
-- INFORMATION_SCHEMA integration — query warehouse for SELECT * resolution
+**Where to start:** the [open issues](https://github.com/PresentJay/dbt-plan/issues),
+particularly those labelled [good first issue](https://github.com/PresentJay/dbt-plan/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
+Each starter issue has an agreed scope, expected results and validation commands.
+Check its assignee and recent comments, then confirm ownership before starting.
 
 **Design decisions:** See [docs/design-notes.md](docs/design-notes.md).
 
 ## Supported
 
 - dbt-core 1.7+, and the dbt Fusion engine (verified against `2.0.0-preview.218`)
-- Any warehouse: Snowflake, BigQuery, Redshift, Postgres, DuckDB, etc. (`--dialect`)
+- Snowflake, BigQuery, Redshift, Postgres, DuckDB and other mapped adapters: dialect inferred from the manifest. Unmapped adapters fall back to Snowflake; see [analysis limits](docs/analysis-limits.md).
 - Python 3.10+
 - CTE, UNION ALL, QUALIFY, window functions, VARIANT access
 
 ## License
 
 Apache-2.0
+
+For adapter dialect fallback, dbt Mesh consumers, and stars over sources or seeds,
+see [analysis limits](docs/analysis-limits.md). For CLI `compile_command` argv
+semantics, the Action's shell command input, and `dbt deps` setup, see
+[compile commands](docs/ci-integration.md#컴파일-명령과-dbt-패키지).

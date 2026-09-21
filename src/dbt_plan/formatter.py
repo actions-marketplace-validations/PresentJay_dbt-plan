@@ -6,7 +6,7 @@ import json
 import sys
 from dataclasses import dataclass, field
 
-from dbt_plan.predictor import DDLPrediction, Safety
+from dbt_plan.predictor import RISK_SAFETY, DDLPrediction, Safety
 
 _SAFETY_ORDER = {Safety.DESTRUCTIVE: 0, Safety.WARNING: 1, Safety.SAFE: 2}
 _SAFETY_ICON = {
@@ -26,6 +26,51 @@ _BOLD = "\033[1m"
 
 
 _MAX_DOWNSTREAM_NAMES = 5  # Truncate long downstream lists for readability
+_MAX_IMPACT_LINES = 10  # Beyond this a pull request comment is unreadable
+_MAX_DATA_TEST_NAME = 50
+_DATA_TEST_NAME_TAIL = 12
+
+
+def _impacts_to_show(impacts: list) -> tuple[list, int]:
+    """The cascade impacts to print, worst first, and how many were held back.
+
+    A `select *` chain can put every model in the project downstream of one
+    change, and a hundred bullets in a pull request comment is a wall nobody
+    reads. Sorted before truncating so the cut only ever removes the least
+    severe; `--format json` still carries all of them.
+    """
+    ordered = sorted(
+        impacts, key=lambda imp: _SAFETY_ORDER[RISK_SAFETY.get(imp.risk, Safety.WARNING)]
+    )
+    return ordered[:_MAX_IMPACT_LINES], max(0, len(ordered) - _MAX_IMPACT_LINES)
+
+
+def _exposure_line(exposure) -> str:
+    """`name (type) -- owner`, dropping whichever half dbt does not carry."""
+    parts = f"{exposure.name} ({exposure.type})" if exposure.type else exposure.name
+    owner = exposure.owner()
+    return f"{parts} -- owner: {owner}" if owner else parts
+
+
+def _display_impact_name(impact) -> str:
+    """Shorten generated data-test names without changing their stable identifier."""
+    name = impact.model_name
+    if not impact.risk.startswith("data_test_") or len(name) <= _MAX_DATA_TEST_NAME:
+        return name
+    head = _MAX_DATA_TEST_NAME - len("...") - _DATA_TEST_NAME_TAIL
+    return f"{name[:head]}...{name[-_DATA_TEST_NAME_TAIL:]}"
+
+
+def _display_impact_names(impacts: list) -> list[str]:
+    """Keep full identifiers when distinct names would shorten identically."""
+    candidates = [_display_impact_name(impact) for impact in impacts]
+    originals: dict[str, set[str]] = {}
+    for candidate, impact in zip(candidates, impacts, strict=True):
+        originals.setdefault(candidate, set()).add(impact.model_name)
+    return [
+        impact.model_name if len(originals[candidate]) > 1 else candidate
+        for candidate, impact in zip(candidates, impacts, strict=True)
+    ]
 
 
 def _format_downstream_line(downstream: list[str]) -> str:
@@ -52,13 +97,39 @@ class CheckResult:
     # from both compiled directories produces no diff entry at all, so it is
     # silently never examined.
     uncompiled_models: list[str] = field(default_factory=list)
+    # Source files newer than the manifest describing them, which means `target/`
+    # may not reflect the code. Every verdict rests on it, so this is reported
+    # even when nothing else is -- an empty diff from a stale compile reads as
+    # "nothing changed".
+    stale_sources: list[str] = field(default_factory=list)
     # Reviewed-and-accepted models. Kept here rather than on DDLPrediction so
     # the predictor stays a pure function of config x column diff, with no
     # knowledge of CI policy.
     acknowledge_models: list[str] = field(default_factory=list)
+    # A baseline (base snapshot) the check could not read. "missing" is an older
+    # or interrupted snapshot -- recoverable, but deleted-model detection is off.
+    # "corrupt" means the manifest exists and will not parse, so the snapshot is
+    # not the revision it claims to be. Either way the report must not be read
+    # as safe (see #155).
+    baseline_problem: str | None = None
+
+    analysis: dict = field(default_factory=dict)
 
     def is_acknowledged(self, pred: DDLPrediction) -> bool:
         return pred.model_name in self.acknowledge_models
+
+
+_BASELINE_PROBLEMS: dict[str, str] = {
+    "missing": (
+        "baseline has no manifest.json -- an older or interrupted snapshot. "
+        "Deleted-model detection is off. Re-run 'dbt-plan snapshot'."
+    ),
+    "corrupt": (
+        "baseline manifest.json will not parse, so this snapshot is not the "
+        "revision it claims to be. Deleted-model detection is off. Re-run "
+        "'dbt-plan snapshot', or treat this report as unverifiable."
+    ),
+}
 
 
 def _has_nothing_to_report(result: CheckResult) -> bool:
@@ -68,12 +139,32 @@ def _has_nothing_to_report(result: CheckResult) -> bool:
     how a check that never looked at a model comes out green. Predictions are not
     the only finding: a model missing from the manifest, one that failed to parse,
     and one the compile never produced all have to survive to the output.
+
+    A stale `target/` is the strongest of these, because an empty diff is exactly
+    what a failed compile produces. An unreadable baseline is the same class: it
+    is the difference between "nothing changed" and "I could not look".
     """
     return not (
         result.predictions
         or result.parse_failures
         or result.skipped_models
         or result.uncompiled_models
+        or result.stale_sources
+        or result.baseline_problem
+    )
+
+
+def _analysis_header(result: CheckResult) -> str:
+    if not result.analysis:
+        return ""
+    info = result.analysis
+    baseline = info.get("baseline") or {}
+    revision = baseline.get("revision") or "unknown revision"
+    created = baseline.get("created_at") or "unknown snapshot time"
+    return (
+        f"  dialect: {info['dialect']} ({info.get('dialect_source', 'unknown')}; "
+        f"adapter: {info.get('adapter_type') or 'unknown'})\n"
+        f"  baseline: {revision}, {created}\n"
     )
 
 
@@ -92,10 +183,15 @@ def format_text(result: CheckResult, *, color: bool | None = None) -> str:
         return f"{c}{_BOLD}{text}{_RESET}"
 
     if _has_nothing_to_report(result):
-        return "dbt-plan -- no model changes detected"
+        return "dbt-plan -- no model changes detected" + (
+            "\n" + _analysis_header(result).rstrip() if result.analysis else ""
+        )
 
     sorted_preds = sorted(result.predictions, key=lambda p: _SAFETY_ORDER.get(p.safety, 9))
     lines = [f"dbt-plan -- {len(result.predictions)} model(s) changed", ""]
+
+    if result.analysis:
+        lines.insert(1, _analysis_header(result))
 
     for pred in sorted_preds:
         mat_info = pred.materialization
@@ -113,13 +209,31 @@ def format_text(result: CheckResult, *, color: bool | None = None) -> str:
         if downstream:
             lines.append(_format_downstream_line(downstream))
         # Cascade impacts
-        for impact in pred.downstream_impacts:
+        shown, held_back = _impacts_to_show(pred.downstream_impacts)
+        for impact, display_name in zip(shown, _display_impact_names(shown), strict=True):
             risk_label = _colored(
-                impact.risk.upper(),
-                Safety.WARNING if impact.risk != "broken_ref" else Safety.DESTRUCTIVE,
+                impact.risk.upper(), RISK_SAFETY.get(impact.risk, Safety.WARNING)
             )
-            lines.append(f"  >> {risk_label}  {impact.model_name}: {impact.reason}")
+            lines.append(f"  >> {risk_label}  {display_name}: {impact.reason}")
+        if held_back:
+            lines.append(f"  >> ... and {held_back} more -- use --format json for all of them")
+        for exposure in pred.downstream_exposures:
+            lines.append(f"  -- EXPOSURE  {_exposure_line(exposure)}")
         lines.append("")
+
+    if result.stale_sources:
+        names = ", ".join(result.stale_sources)
+        warn = _colored("WARNING", Safety.WARNING) if use_color else "WARNING"
+        lines.append(
+            f"{warn}: target/ may be out of date -- {names} "
+            f"{'is' if len(result.stale_sources) == 1 else 'are'} not verified as current compilation input. "
+            f"Recompile, or this report describes code you no longer have."
+        )
+
+    if result.baseline_problem:
+        warn = _colored("WARNING", Safety.WARNING) if use_color else "WARNING"
+        detail = _BASELINE_PROBLEMS.get(result.baseline_problem, result.baseline_problem)
+        lines.append(f"{warn}: {detail}")
 
     if result.parse_failures:
         names = ", ".join(result.parse_failures)
@@ -167,10 +281,15 @@ def _summary_line(result: CheckResult) -> str:
 def format_github(result: CheckResult) -> str:
     """Format result as GitHub-flavored markdown."""
     if _has_nothing_to_report(result):
-        return "### dbt-plan -- no model changes detected"
+        return "### dbt-plan -- no model changes detected" + (
+            "\n\n" + _analysis_header(result).rstrip() if result.analysis else ""
+        )
 
     sorted_preds = sorted(result.predictions, key=lambda p: _SAFETY_ORDER.get(p.safety, 9))
     lines = [f"### dbt-plan -- {len(result.predictions)} model(s) changed", ""]
+
+    if result.analysis:
+        lines.insert(1, _analysis_header(result))
 
     for pred in sorted_preds:
         icon = _SAFETY_ICON.get(pred.safety, "")
@@ -189,12 +308,29 @@ def format_github(result: CheckResult) -> str:
         downstream = result.downstream_map.get(pred.model_name, [])
         if downstream:
             lines.append("- " + _format_downstream_line(downstream).lstrip())
-        for impact in pred.downstream_impacts:
-            risk_icon = "\u26a0\ufe0f" if impact.risk == "build_failure" else "\U0001f534"
+        shown, held_back = _impacts_to_show(pred.downstream_impacts)
+        for impact, display_name in zip(shown, _display_impact_names(shown), strict=True):
+            risk_icon = _SAFETY_ICON[RISK_SAFETY.get(impact.risk, Safety.WARNING)]
             lines.append(
-                f"- {risk_icon} **{impact.risk.upper()}** `{impact.model_name}`: {impact.reason}"
+                f"- {risk_icon} **{impact.risk.upper()}** `{display_name}`: {impact.reason}"
             )
+        if held_back:
+            lines.append(f"- ... and {held_back} more -- use `--format json` for all of them")
+        for exposure in pred.downstream_exposures:
+            lines.append(f"- **EXPOSURE** {_exposure_line(exposure)}")
         lines.append("")
+
+    if result.stale_sources:
+        names = ", ".join(result.stale_sources)
+        lines.append(
+            f"> **WARNING**: `target/` may be out of date -- {names} "
+            f"{'is' if len(result.stale_sources) == 1 else 'are'} not verified as current compilation input. "
+            f"Recompile, or this report describes code you no longer have."
+        )
+
+    if result.baseline_problem:
+        detail = _BASELINE_PROBLEMS.get(result.baseline_problem, result.baseline_problem)
+        lines.append(f"> **WARNING**: {detail}")
 
     if result.parse_failures:
         names = ", ".join(result.parse_failures)
@@ -243,6 +379,16 @@ def format_json(result: CheckResult) -> str:
         downstream = result.downstream_map.get(pred.model_name, [])
         if downstream:
             model["downstream"] = downstream
+        if pred.downstream_exposures:
+            model["downstream_exposures"] = [
+                {
+                    "name": exp.name,
+                    "type": exp.type,
+                    "owner": exp.owner(),
+                    "url": exp.url,
+                }
+                for exp in pred.downstream_exposures
+            ]
         if pred.downstream_impacts:
             model["downstream_impacts"] = [
                 {
@@ -271,7 +417,12 @@ def format_json(result: CheckResult) -> str:
         "summary": summary,
         "models": models,
         "parse_failures": result.parse_failures,
+        "stale_sources": result.stale_sources,
         "skipped_models": result.skipped_models,
         "uncompiled_models": result.uncompiled_models,
     }
+    if result.baseline_problem:
+        output["baseline_problem"] = result.baseline_problem
+    if result.analysis:
+        output["analysis"] = result.analysis
     return json.dumps(output, indent=2)

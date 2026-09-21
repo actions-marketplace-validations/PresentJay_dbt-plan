@@ -8,20 +8,34 @@
 Install with `pip install dbt-plan`. Requires Python 3.10+. The only runtime dependency is
 sqlglot.
 
+It is used the way `terraform plan` is used: before the command that changes the warehouse,
+not only in CI afterwards. `dbt-plan check` takes about 0.1 seconds once a baseline exists,
+and 0.5 seconds on a 200-model project where every model changed, so it belongs in the edit
+loop. The cost is the `dbt compile` that produces its input, which you were running anyway.
+
+The case with no cheap alternative is a macro change: no model file has a diff, yet every
+model calling the macro may gain or lose columns. dbt-plan names the affected models and
+the columns.
+
 ## What it does and does not do
 
 dbt-plan reads `target/compiled/**/*.sql` and `target/manifest.json`, diffs them against a
-saved baseline, and reports column additions/removals, materialization changes, and
-downstream models broken by a dropped column. Exit codes drive CI: 0 safe, 1 destructive,
-2 warning.
+saved baseline, and reports column additions/removals, materialization changes, changes an
+enforced contract will reject, and everything downstream that a dropped column breaks:
+models that name it, models that select `*` and lose it without their own file changing,
+data tests, and unit tests whose fixtures pin it down. Exit codes drive CI: 0 safe,
+1 destructive, 2 review required, 3 execution error (next minor release; see docs/exit-codes.md).
 
 It does not execute SQL, simulate `dbt run`, or connect to a warehouse. It does not judge
 `--full-refresh` behavior (a runtime flag), seed/source changes, or pre/post-hook DDL.
 
 Note on credentials: dbt-plan itself never connects, but producing its input requires
-`dbt compile`, which does connect. In CI, run compile where credentials already exist;
-dbt-plan then reads the artifacts. `dbt compile` reads no tables, so a login with warehouse
-USAGE is usually enough unless project macros introspect.
+`dbt compile`. Under dbt Core that connects, so in CI run compile where credentials already
+exist and dbt-plan reads the artifacts; a login with warehouse USAGE is usually enough
+unless project macros introspect. Under the Fusion engine `dbt compile` needs no connection
+at all, which is what makes a credential-free check on a fork's pull request possible.
+Models using introspective macros still fail to compile there, and dbt-plan reports them as
+an incomplete compile rather than analysing what is left in silence.
 
 ## Risk rules
 
@@ -29,13 +43,18 @@ Safety is decided by materialization crossed with `on_schema_change`:
 
 - table or view, any setting: `CREATE OR REPLACE` — safe
 - ephemeral: no physical object — safe
-- incremental + `ignore`: no DDL — safe
+- incremental + `ignore`: no schema DDL; changed or unknown columns require review (existing targets may fail)
 - incremental + `append_new_columns`: ADD COLUMN only — safe
 - incremental + `fail`: build failure on schema drift — warning
 - incremental + `sync_all_columns`: ADD and DROP COLUMN — destructive if a column was removed
 - snapshot, any setting: review required — warning
 - model removed, any setting: destructive
 - unrecognized `on_schema_change`: warning
+- materialized_view, a dynamic table or a custom materialization with no
+  `on_schema_change` set: warning. dbt-plan has no rule for the DDL these emit, and
+  materialized views are driven by `on_configuration_change` rather than
+  `on_schema_change`. Setting `on_schema_change` explicitly is taken as an assertion
+  about how that materialization behaves and the incremental rules above then apply.
 
 When a column cannot be extracted, dbt-plan reports "review required" rather than "safe".
 Being noisy is acceptable; missing a destructive change is not.
@@ -73,3 +92,4 @@ expose those credentials to code from any fork.
 - [Homepage](https://presentjay.github.io/dbt-plan/)
 - [Source](https://github.com/PresentJay/dbt-plan)
 - [PyPI](https://pypi.org/project/dbt-plan/)
+- [Sitemap](https://presentjay.github.io/dbt-plan/sitemap.xml)
