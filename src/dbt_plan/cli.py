@@ -330,6 +330,8 @@ def _find_compiled_dir(target_dir: Path) -> CompiledLayout | None:
 
 def _do_snapshot(args: argparse.Namespace) -> None:
     """Save current compiled state as baseline (compiled SQL + manifest)."""
+    from dbt_plan.snapshot_store import staged_snapshot
+
     project_dir = Path(args.project_dir)
     target_dir = project_dir / args.target_dir
     base_dir = project_dir / ".dbt-plan" / "base"
@@ -347,41 +349,6 @@ def _do_snapshot(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(ERROR_EXIT_CODE)
-
-    if base_dir.exists():
-        # Validate base_dir is inside project to prevent path traversal via symlinks
-        resolved_base = base_dir.resolve()
-        resolved_project = project_dir.resolve()
-        # is_relative_to includes equality; require a strict child before deleting.
-        if resolved_base == resolved_project or not resolved_base.is_relative_to(resolved_project):
-            print(
-                "Error: snapshot base directory escapes project directory",
-                file=sys.stderr,
-            )
-            sys.exit(ERROR_EXIT_CODE)
-        if base_dir.is_file():
-            base_dir.unlink()
-        else:
-            shutil.rmtree(base_dir)
-
-    # Save compiled SQL (symlinks=True prevents following symlinks outside project)
-    compiled_dest = base_dir / "compiled"
-    if found and found.model_dirs == ("__dbt_plan_manifest_only__",):
-        compiled_dest.mkdir(parents=True)
-    else:
-        shutil.copytree(compiled_dir, compiled_dest, symlinks=True)
-
-    # Save manifest.json alongside compiled SQL
-    manifest_src = target_dir / "manifest.json"
-    if manifest_src.exists():
-        shutil.copy2(manifest_src, base_dir / "manifest.json")
-    else:
-        print(
-            f"Warning: manifest.json not found in {target_dir}. "
-            "Run 'dbt compile' to generate it. "
-            "Without it, 'dbt-plan check' will fail.",
-            file=sys.stderr,
-        )
 
     import subprocess
     from datetime import datetime, timezone
@@ -402,16 +369,38 @@ def _do_snapshot(args: argparse.Namespace) -> None:
             revision = git.stdout.strip()
     except OSError:
         pass
-    (base_dir / "provenance.json").write_text(
-        json.dumps(
-            {
-                "revision": revision,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "dbt_plan_version": __version__,
-            }
-        ),
-        encoding="utf-8",
-    )
+    try:
+        with staged_snapshot(project_dir, base_dir) as stage:
+            # Preserve symlinks rather than copying their targets outside the project.
+            compiled_dest = stage / "compiled"
+            if found and found.model_dirs == ("__dbt_plan_manifest_only__",):
+                compiled_dest.mkdir()
+            else:
+                shutil.copytree(compiled_dir, compiled_dest, symlinks=True)
+
+            manifest_src = target_dir / "manifest.json"
+            if manifest_src.exists():
+                shutil.copy2(manifest_src, stage / "manifest.json")
+            else:
+                print(
+                    f"Warning: manifest.json not found in {target_dir}. "
+                    "Run 'dbt compile' to generate it. "
+                    "Without it, 'dbt-plan check' will fail.",
+                    file=sys.stderr,
+                )
+            (stage / "provenance.json").write_text(
+                json.dumps(
+                    {
+                        "revision": revision,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "dbt_plan_version": __version__,
+                    }
+                ),
+                encoding="utf-8",
+            )
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(ERROR_EXIT_CODE)
     print(f"Snapshot saved to {base_dir}", file=sys.stderr)
 
 
@@ -668,24 +657,52 @@ def _do_stats(args: argparse.Namespace) -> None:
             print(f"    {label:38s} {count:>4}")
 
 
+def _ambiguous_acknowledgement_names(*manifests: dict) -> set[str]:
+    """Retain collisions lost by name-keyed indexes, including other resource kinds.
+
+    The same unique ID in both revisions is one resource. Distinct package,
+    version, test or exposure IDs sharing a spelling must never share a waiver.
+    """
+    from dbt_plan.manifest import model_key
+
+    identities: dict[str, set[str]] = {}
+    for manifest in manifests:
+        for section in ("nodes", "unit_tests", "exposures"):
+            for node_id, node in (manifest.get(section) or {}).items():
+                if (node.get("config") or {}).get("enabled") is False:
+                    continue
+                if node_id.startswith("model."):
+                    names = {model_key(node_id)}
+                    if node.get("path"):
+                        names.add(Path(node["path"]).stem)
+                else:
+                    names = {node.get("name")}
+                for name in names:
+                    if name:
+                        identities.setdefault(name, set()).add(node_id)
+    return {name for name, ids in identities.items() if len(ids) > 1}
+
+
 def _exit_code_for(result: CheckResult, warning_exit_code: int) -> int:
     """Map a check result to a process exit code.
 
-    Acknowledged models are reported but excluded from the verdict -- that is
-    the entire point of acknowledging one. Everything else still counts, so
-    acknowledging one model never excuses another model's risk, an unrelated
-    warning, or a parse failure.
+    Waive known findings only on the named affected resource. Raw aggregate
+    severities remain intact for reports and MCP consumers.
     """
-    from dbt_plan.predictor import Safety
+    from dbt_plan.predictor import RISK_SAFETY, Safety
 
+    active = []
     for pred in result.predictions:
-        if result.is_acknowledged(pred):
-            continue
-        if pred.safety == Safety.DESTRUCTIVE:
-            return 1
-    if any(
-        p.safety == Safety.WARNING and not result.is_acknowledged(p) for p in result.predictions
-    ):
+        if not result.own_waived(pred):
+            active.append(pred.own_verdict)
+        active.extend(
+            RISK_SAFETY.get(impact.risk, Safety.WARNING)
+            for impact in pred.downstream_impacts
+            if not result.impact_waived(impact)
+        )
+    if Safety.DESTRUCTIVE in active:
+        return 1
+    if Safety.WARNING in active:
         return warning_exit_code
     if result.parse_failures:
         return warning_exit_code
@@ -1739,11 +1756,13 @@ def _do_check(args: argparse.Namespace) -> int:
                         dependent.on_schema_change,
                         risk="contract_violation",
                         reason="; ".join(op.operation for op in contract.operations),
+                        waiver_allowed=contract.known_operations,
                     )
                 )
         if len(impacts) != len(prediction.downstream_impacts):
             predictions[pos] = _replace(
                 prediction,
+                own_safety=prediction.own_verdict,
                 downstream_impacts=impacts,
                 safety=prediction.safety
                 if prediction.safety == Safety.DESTRUCTIVE
@@ -1775,6 +1794,7 @@ def _do_check(args: argparse.Namespace) -> int:
         acknowledge_models=config.acknowledge_models,
         baseline_problem=baseline_problem,
         analysis=analysis,
+        ambiguous_resources=_ambiguous_acknowledgement_names(manifest, base_manifest or {}),
     )
     if fmt == "json":
         print(format_json(check_result))
